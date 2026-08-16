@@ -70,3 +70,15 @@ target_link_libraries(gmx_eternia_pme_bench PRIVATE
 # choice for the same reason.
 set_target_properties(gmx_eternia_pme_bench PROPERTIES
     CUDA_SEPARABLE_COMPILATION OFF)
+
+# Nonbonded (nbnxm) paged pair list. Separate target from the PME bench: the
+# PME grid does not compose into an out-of-core PME (cuFFT needs the whole
+# grid), so this is the GROMACS target that actually does.
+set_source_files_properties(eternia_nb_bench.cc PROPERTIES LANGUAGE CUDA)
+add_executable(gmx_eternia_nb_bench eternia_nb_bench.cc)
+target_compile_definitions(gmx_eternia_nb_bench PRIVATE CLIO_YIELD_CORO)
+target_include_directories(gmx_eternia_nb_bench PRIVATE ${IOWARP_CORE_INCLUDE_DIR})
+target_link_libraries(gmx_eternia_nb_bench PRIVATE
+    clio::run::cxx clio::run::clio_run_cxx_gpu clio::run::admin_client
+    clio::run::bdev_client clio::cte::core_client ctp::cudacxx CUDA::cudart)
+set_target_properties(gmx_eternia_nb_bench PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
