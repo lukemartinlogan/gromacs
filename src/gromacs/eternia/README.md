@@ -83,7 +83,30 @@ reference called the same function. The paging was genuinely being tested and
 those results stand; the arithmetic being paged was not a PME spread. The
 charge-conservation check exists so that cannot recur.
 
-## Larger than VRAM
+## IMPORTANT: this does not compose into an out-of-core PME
+
+Paging the PME real-space grid does **not** let GROMACS run a PME larger than
+VRAM, and the reason is not in this code.
+
+The PME pipeline is spread -> 3D FFT -> solve -> inverse FFT -> gather, and
+`gpu_3dfft_cufft.cu` calls
+`cufftExecR2C(plan, realGrid_, complexGrid_)` with raw device pointers to the
+whole real and complex grids. cuFFT has no streaming or host-backed mode --
+cuFFTMp and heFFTe distribute across ranks and GPUs, not to host storage. So
+the stage immediately after spread needs everything spread just wrote, plus a
+complex grid of comparable size. The effective ceiling is roughly 2x the real
+grid whatever spread does.
+
+What follows below is therefore a demonstration that **the spread kernel
+scales past VRAM**, and a measurement of paged scatter performance. It is not
+a larger-than-VRAM PME, and it should not be presented as one.
+
+The GROMACS target that DOES compose is the **nonbonded** path: coordinates
+(`xq`) and the cluster pair list, consumed by local force accumulation with
+no global transform in the way. That is the analogue of the LAMMPS
+integration, which works end to end for exactly this reason.
+
+## Larger than VRAM (spread only)
 
 On an 8 GiB (7.99 GiB usable) RTX 4070 Laptop:
 
