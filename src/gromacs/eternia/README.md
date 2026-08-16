@@ -98,6 +98,34 @@ throughout, against a GPU-side cache of `blocks * slots * page` = 64 * 8 *
 256 KB = 128 MB, about 1.2% of the grid. Agreement with the CPU reference is
 1.49e-07, i.e. single-precision rounding.
 
+## Spline equivalence with GROMACS
+
+The weights this kernel uses are the closed form of the cubic cardinal
+B-spline. GROMACS computes the same thing with the de Boor recursion in
+`calculate_splines` (`pme_gpu_calculate_splines.cuh`). The two agree to
+**2.2e-16** over dr in [0, 1], sampled at 1000 points -- machine epsilon, so
+this is the same polynomial and not merely a similar one.
+
+That closes the arithmetic half of the drop-in. What remains is the gridline
+index: GROMACS derives it through `d_fractShiftsTable` /
+`d_gridlineIndicesTable`, which also handle triclinic boxes and the unit-cell
+shift, where this harness takes `floor(t)` directly -- equivalent for an
+orthorhombic box with no shift, and not yet equivalent in general.
+
+## Why this is not a drop-in for pme_gpu_spread as it stands
+
+`spread_charges` consumes `theta` in a **warp-interleaved layout**
+(`getSplineParamIndexBase`) whose indexing is derived from the atom's warp
+position *within GROMACS's own spread block*. A paged kernel uses a
+different, page-aligned decomposition, so consuming that layout would couple
+it to GROMACS's block size -- precisely the sort of coupling that produces
+silent near-miss results.
+
+The cleaner seam is the `computeSplines=true, spreadCharges=true` path: take
+coordinates, charges and grid geometry, compute splines internally, produce
+the grid. That is what this kernel does, and it is why the spline had to
+match GROMACS's exactly rather than merely be spline-shaped.
+
 ## Next
 
 Wire this into GROMACS proper: replace `pme_gpu_spread` and the matching
