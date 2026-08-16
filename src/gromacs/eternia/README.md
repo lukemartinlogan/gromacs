@@ -50,7 +50,15 @@ with every counter reporting clean.
 
 ## Verification
 
-Against a CPU reference computing the identical spread. Checked across
+Two checks, and the second matters more than the first.
+
+**Charge conservation** is an INDEPENDENT physical invariant: the spline
+weights partition unity and the atoms are placed clear of the x edge, so
+every charge lands on the grid in full and `sum(grid)` must equal `sum(q)`.
+A reference that shares the kernel's arithmetic cannot catch an error in that
+arithmetic; this can. It is what would have caught the spline bug below.
+
+**A CPU reference** computing the identical spread. Checked across
 configurations rather than in one, because how often a fault suspends the
 kernel is what changes the code path:
 
@@ -62,6 +70,18 @@ kernel is what changes the code path:
 | 64   | 20k   | 1MB  | 4      | 2     | 8.9e-08      | 1 / 0           |
 | 128  | 200k  | 64KB | 32     | 3     | 1.2e-07      | 128 / 32        |
 | 128  | 200k  | 16KB | 8      | 3     | 1.2e-07      | 512 / 488       |
+
+Charge error is ~3e-06 on 20k atoms and ~1.4e-05 on 200k, i.e. the
+sqrt(N)*eps expected of that many single-precision adds.
+
+### A caveat worth stating plainly
+
+An earlier version of `Bspline4` did not partition unity: `w[2]` was written
+in terms of `(1 - frac)` and expanded to a second copy of `w[1]`, so the four
+weights summed to 1.5 at frac = 0. Every test still passed, because the CPU
+reference called the same function. The paging was genuinely being tested and
+those results stand; the arithmetic being paged was not a PME spread. The
+charge-conservation check exists so that cannot recur.
 
 ## Larger than VRAM
 

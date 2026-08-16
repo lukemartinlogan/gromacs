@@ -95,12 +95,22 @@ struct GridGeom {
  * compute the SAME thing, so any difference is the paging and nothing else.
  */
 CTP_INLINE_CROSS_FUN void Bspline4(float frac, float *w) {
-  const float f = frac;
-  const float g = 1.0f - f;
+  // Cubic cardinal B-spline weights, the same partition of unity PME uses.
+  //
+  // These MUST sum to 1 for every frac: the spread distributes a charge over
+  // the surrounding grid points, so weights that do not partition unity
+  // change the total charge on the grid. An earlier version of this function
+  // wrote w[2] in terms of (1 - frac) and thereby produced a second copy of
+  // w[1]; the four weights summed to 1.5 at frac = 0. It went unnoticed
+  // because the CPU reference called the SAME function, so the comparison was
+  // self-consistent and the paging it was written to test really was being
+  // tested -- but the kernel was not computing a PME spread.
+  const float t = frac;
+  const float g = 1.0f - t;
   w[0] = g * g * g / 6.0f;
-  w[1] = (4.0f - 6.0f * f * f + 3.0f * f * f * f) / 6.0f;
-  w[2] = (1.0f + 3.0f * g + 3.0f * g * g - 3.0f * g * g * g) / 6.0f;
-  w[3] = f * f * f / 6.0f;
+  w[1] = (3.0f * t * t * t - 6.0f * t * t + 4.0f) / 6.0f;
+  w[2] = (-3.0f * t * t * t + 3.0f * t * t + 3.0f * t + 1.0f) / 6.0f;
+  w[3] = t * t * t / 6.0f;
 }
 
 #if defined(ETERNIA_PME_CORO)
@@ -500,9 +510,19 @@ int main(int argc, char **argv) {
       max_abs = std::max(max_abs, std::fabs(r - v));
     }
   }
+  // CHARGE CONSERVATION: an INDEPENDENT physical invariant, not another
+  // comparison against the same code. The spline weights partition unity and
+  // the atoms are placed clear of the x edge, so every atom's charge lands on
+  // the grid in full and sum(grid) must equal sum(q). A reference that shares
+  // the kernel's arithmetic cannot catch an error in that arithmetic; this
+  // can.
+  double sum_q = 0.0;
+  for (u64 i = 0; i < natoms; ++i) sum_q += aq[i];
+  const double q_err = std::fabs(sum_got - sum_q);
   std::printf("  verify: max|diff|=%.3e sum_ref=%.6f sum_got=%.6f "
-              "missing_pages=%llu\n",
-              max_abs, sum_ref, sum_got, (unsigned long long)missing);
+              "sum_q=%.6f charge_err=%.3e missing_pages=%llu\n",
+              max_abs, sum_ref, sum_got, sum_q, q_err,
+              (unsigned long long)missing);
 
   // The grid is a sum of ~natoms*64 single-precision terms, so a strict
   // equality test would fail on reassociation alone. Scale the tolerance to
@@ -510,8 +530,13 @@ int main(int argc, char **argv) {
   double peak = 0.0;
   for (u64 q = 0; q < points; ++q) peak = std::max(peak, std::fabs((double)ref[q]));
   const double tol = 1e-4 * std::max(peak, 1e-6);
-  const bool ok = (missing == 0) && (max_abs <= tol);
-  std::printf("%s (tol=%.3e, peak=%.3e)\n", ok ? "PASS" : "FAIL", tol, peak);
+  // Charge is a sum of natoms*64 single-precision adds, so the tolerance
+  // scales with the count, not with a fixed epsilon.
+  const double q_tol = 1e-5 * std::sqrt(static_cast<double>(natoms)) *
+                       std::max(std::fabs(sum_q), 1.0);
+  const bool ok = (missing == 0) && (max_abs <= tol) && (q_err <= q_tol);
+  std::printf("%s (tol=%.3e, peak=%.3e, q_tol=%.3e)\n", ok ? "PASS" : "FAIL",
+              tol, peak, q_tol);
   return ok ? 0 : 1;
 #endif
 }
