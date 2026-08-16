@@ -87,9 +87,14 @@ struct CjPacked {
  */
 constexpr int kCjPackedInts = 8;   // 6 used, 2 padding
 
-/** u64 slots of per-block global scratch: 2 for the page range, plus room
- *  for kAtomsPerSc*3 staged float coordinates. */
-constexpr int kScratchU64PerBlock = 2 + (kAtomsPerSc * 3 + 1) / 2;
+/** Pages recorded per pass-A window: 2048 bits = 64 u32 = 32 u64. */
+constexpr int kPageBitmapBits = 2048;
+constexpr int kPageBitmapWords = kPageBitmapBits / 32;
+
+/** u64 slots of per-block global scratch: 2 for the page range, the touched
+ *  bitmap, and room for kAtomsPerSc*3 staged float coordinates. */
+constexpr int kScratchU64PerBlock =
+    2 + kPageBitmapWords / 2 + (kAtomsPerSc * 3 + 1) / 2;
 
 /** Mirrors nbnxm_sci_t. */
 struct Sci {
@@ -150,7 +155,8 @@ __device__ gy::YCoroMain NbCoro(gv::DeviceVector<int> cjp,
   // co_await can exit the kernel and have this block relaunched.
   u64 *pg_lo_s = scratch + static_cast<u64>(block) * kScratchU64PerBlock;
   u64 *pg_hi_s = pg_lo_s + 1;
-  float *xi_s = reinterpret_cast<float *>(pg_lo_s + 2);
+  u32 *touched = reinterpret_cast<u32 *>(pg_lo_s + 2);
+  float *xi_s = reinterpret_cast<float *>(pg_lo_s + 2 + kPageBitmapWords / 2);
 
   for (int s = block; s < numSci; s += nblocks) {
     const Sci sc = scis[s];
@@ -223,67 +229,88 @@ __device__ gy::YCoroMain NbCoro(gv::DeviceVector<int> cjp,
       __syncthreads();
       const u64 pg_lo = pg_lo_s[0], pg_hi = pg_hi_s[0];
 
-      // PASS B: hold each coordinate page once, block-collectively, and let
-      // every thread evaluate the pairs of its own i-atom landing in it.
+      // PASS B: hold each TOUCHED coordinate page once, block-collectively.
+      //
+      // Only the touched ones. An earlier version held every page in
+      // [pg_lo, pg_hi], which for scattered j-clusters is a huge range that is
+      // mostly empty: the coordinate cache thrashed completely (2,173,228
+      // faults against 2,172,716 evictions on a 4.2M-atom run) and the kernel
+      // took 411 s of a 417 s run. The bitmap is what makes the held set
+      // proportional to the work rather than to the address span.
       if (pg_lo != ~0ull) {
-        for (u64 pg = pg_lo; pg <= pg_hi; ++pg) {
-          gv::DeviceVector<float> xj = xq;
-          co_await xj.HoldPageCoro(pg * xpe, xpe, &run);
-          const u64 xlo = pg * xpe, xhi = xlo + xpe;
-
-          for (u64 entry = first; entry < last; ++entry) {
+        for (u64 win = pg_lo; win <= pg_hi; win += kPageBitmapBits) {
+          const u64 win_hi =
+              (win + kPageBitmapBits - 1 < pg_hi) ? (win + kPageBitmapBits - 1)
+                                                  : pg_hi;
+          for (u32 w = threadIdx.x; w < kPageBitmapWords; w += blockDim.x) {
+            touched[w] = 0u;
+          }
+          __syncthreads();
+          for (u64 entry = first + threadIdx.x; entry < last;
+               entry += blockDim.x) {
             const u64 base = entry * kCjPackedInts;
-            for (u32 t = threadIdx.x; t < kAtomsPerSc * kJGroupSize;
-                 t += blockDim.x) {
-              const u32 ii = t / kJGroupSize;
-              const u32 jslot = t % kJGroupSize;
+            for (int jslot = 0; jslot < kJGroupSize; ++jslot) {
               const int cj = cjp.at(base + jslot);
               if (cj < 0) continue;
-              // ONE 32-bit word: the bit index is jslot*8 + icluster, which
-              // is 4*8 = 32 bits exactly, so it never reaches the second
-              // word. Selecting the word by (ii / 32) -- as if the mask were
-              // indexed by i-ATOM rather than by i-CLUSTER -- read the second
-              // word for the upper 32 atoms, and that word is always zero.
-              // Exactly half the i-atoms were skipped, which showed up as an
-              // energy exactly half the reference's.
-              //
-              // GROMACS splits the mask across two warps (imei[2]); this
-              // harness keeps a single word and leaves the second reserved.
-              // That is a simplification of the real layout, not a claim to
-              // match it.
-              const unsigned imask =
-                  static_cast<unsigned>(cjp.at(base + kJGroupSize));
-              const u32 icl = ii / kClusterSize;
-              if (!((imask >> (jslot * kClustersPerSc + icl)) & 1u)) continue;
-
-              const u64 ia = i0 + ii;
-              // From scratch, not through the cache: the j-page hold above
-              // may well have evicted the page atom ia lives on.
-              const float ix = xi_s[ii * 3 + 0];
-              const float iy = xi_s[ii * 3 + 1];
-              const float iz = xi_s[ii * 3 + 2];
-
-              for (int jj = 0; jj < kClusterSize; ++jj) {
-                const u64 ja = static_cast<u64>(cj) * kClusterSize + jj;
-                if (ja == ia) continue;
-                const u64 jo = ja * 4;
-                if (jo < xlo || jo + 3 >= xhi) continue;  // another page
-                const float dx = ix - xj.at(jo + 0);
-                const float dy = iy - xj.at(jo + 1);
-                const float dz = iz - xj.at(jo + 2);
-                const float rsq = dx * dx + dy * dy + dz * dz;
-                ++n_pairs;
-                if (rsq >= prm.cutoffSq || rsq == 0.0f) continue;
-                float fscal, ener;
-                LjPair(rsq, prm, &fscal, &ener);
-                e_local += 0.5 * static_cast<double>(ener);
-                atomicAdd(&f[ia * 4 + 0], dx * fscal);
-                atomicAdd(&f[ia * 4 + 1], dy * fscal);
-                atomicAdd(&f[ia * 4 + 2], dz * fscal);
+              const u64 ja0 = static_cast<u64>(cj) * kClusterSize;
+              const u64 q0 = (ja0 * 4) / xpe;
+              const u64 q1 = ((ja0 + kClusterSize - 1) * 4 + 3) / xpe;
+              for (u64 q = q0; q <= q1; ++q) {
+                if (q < win || q > win_hi) continue;
+                const u32 b = static_cast<u32>(q - win);
+                atomicOr(&touched[b >> 5], 1u << (b & 31u));
               }
             }
           }
           __syncthreads();
+
+          for (u64 pg = win; pg <= win_hi; ++pg) {
+            const u32 b = static_cast<u32>(pg - win);
+            if ((touched[b >> 5] & (1u << (b & 31u))) == 0u) continue;
+            gv::DeviceVector<float> xj = xq;
+            co_await xj.HoldPageCoro(pg * xpe, xpe, &run);
+            const u64 xlo = pg * xpe, xhi = xlo + xpe;
+
+            for (u64 entry = first; entry < last; ++entry) {
+              const u64 base = entry * kCjPackedInts;
+              for (u32 t = threadIdx.x; t < kAtomsPerSc * kJGroupSize;
+                   t += blockDim.x) {
+                const u32 ii = t / kJGroupSize;
+                const u32 jslot = t % kJGroupSize;
+                const int cj = cjp.at(base + jslot);
+                if (cj < 0) continue;
+                const unsigned imask =
+                    static_cast<unsigned>(cjp.at(base + kJGroupSize));
+                const u32 icl = ii / kClusterSize;
+                if (!((imask >> (jslot * kClustersPerSc + icl)) & 1u)) continue;
+
+                const u64 ia = i0 + ii;
+                const float ix = xi_s[ii * 3 + 0];
+                const float iy = xi_s[ii * 3 + 1];
+                const float iz = xi_s[ii * 3 + 2];
+
+                for (int jj = 0; jj < kClusterSize; ++jj) {
+                  const u64 ja = static_cast<u64>(cj) * kClusterSize + jj;
+                  if (ja == ia) continue;
+                  const u64 jo = ja * 4;
+                  if (jo < xlo || jo + 3 >= xhi) continue;
+                  const float dx = ix - xj.at(jo + 0);
+                  const float dy = iy - xj.at(jo + 1);
+                  const float dz = iz - xj.at(jo + 2);
+                  const float rsq = dx * dx + dy * dy + dz * dz;
+                  ++n_pairs;
+                  if (rsq >= prm.cutoffSq || rsq == 0.0f) continue;
+                  float fscal, ener;
+                  LjPair(rsq, prm, &fscal, &ener);
+                  e_local += 0.5 * static_cast<double>(ener);
+                  atomicAdd(&f[ia * 4 + 0], dx * fscal);
+                  atomicAdd(&f[ia * 4 + 1], dy * fscal);
+                  atomicAdd(&f[ia * 4 + 2], dz * fscal);
+                }
+              }
+            }
+            __syncthreads();
+          }
         }
       }
       __syncthreads();
@@ -489,20 +516,46 @@ int main(int argc, char **argv) {
   vxq.EnableStats();
 
   clio::cte::core::Client core(clio::cte::core::kCtePoolId);
+  // PIPELINED SEED. One synchronous PutBlob per page means a round trip per
+  // page, and at these sizes that is tens of thousands of them -- setup
+  // dominates the run and says nothing about the vector. Keep kInFlight puts
+  // outstanding instead.
+  //
+  // The ring of buffers is required, not an optimisation: the private-memory
+  // put stages through SHM and the staging buffer is released when the future
+  // is waited on, so reusing one host buffer while a put is still in flight
+  // would hand the runtime bytes that have already been overwritten.
+  constexpr int kInFlight = 16;
   auto seed = [&](auto &vec, const auto &host, u64 esz) {
     const u64 pe = (page_kb * 1024) / esz;
     const u64 np = (host.size() + pe - 1) / pe;
-    std::vector<char> buf(page_kb * 1024);
+    std::vector<std::vector<char>> bufs(kInFlight,
+                                        std::vector<char>(page_kb * 1024));
+    std::vector<clio::run::Future<clio::cte::core::PutBlobTask>> futs(kInFlight);
+    std::vector<bool> live(kInFlight, false);
     for (u64 p = 0; p < np; ++p) {
-      std::memset(buf.data(), 0, buf.size());
+      const int slot = (int)(p % kInFlight);
+      if (live[slot]) {
+        futs[slot].Wait();
+        if (futs[slot].get() == nullptr || futs[slot]->GetReturnCode() != 0) {
+          std::fprintf(stderr, "seed failed\n");
+          std::exit(1);
+        }
+        live[slot] = false;
+      }
+      std::memset(bufs[slot].data(), 0, bufs[slot].size());
       const u64 lo = p * pe, hi = std::min(lo + pe, (u64)host.size());
-      std::memcpy(buf.data(), host.data() + lo, (hi - lo) * esz);
+      std::memcpy(bufs[slot].data(), host.data() + lo, (hi - lo) * esz);
       char nm[32]; gv::PageBlobName(p, nm);
-      auto f2 = core.AsyncPutBlob(vec.TagId(), std::string(nm), 0, buf.size(),
-                                  buf.data(), 1.0f);
-      f2.Wait();
-      if (f2.get() == nullptr || f2->GetReturnCode() != 0) {
-        std::fprintf(stderr, "seed failed at page %llu\n", (unsigned long long)p);
+      futs[slot] = core.AsyncPutBlob(vec.TagId(), std::string(nm), 0,
+                                     bufs[slot].size(), bufs[slot].data(), 1.0f);
+      live[slot] = true;
+    }
+    for (int q = 0; q < kInFlight; ++q) {
+      if (!live[q]) continue;
+      futs[q].Wait();
+      if (futs[q].get() == nullptr || futs[q]->GetReturnCode() != 0) {
+        std::fprintf(stderr, "seed failed\n");
         std::exit(1);
       }
     }
