@@ -48,6 +48,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <climits>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -68,8 +69,27 @@ struct CjPacked {
   int cj[kJGroupSize];
   unsigned imask[2];
 };
-/** Ints per packed entry, since the vector is paged as int. */
-constexpr int kCjPackedInts = kJGroupSize + 2;
+/**
+ * Ints per packed entry in the paged vector: PADDED TO A POWER OF TWO.
+ *
+ * The payload is 6 ints (cj[4] + imask[2]). Storing it as 6 means the entry
+ * stride does not divide the page size, so entries straddle page boundaries
+ * -- and a straddling entry is one no single hold can read, because a hold
+ * covers one page. The first version of this kernel silently DROPPED those
+ * entries: they were excluded from the segment that started them and from
+ * the next one, which the config sweep caught as a wrong answer at 4 KB
+ * pages while 64 KB and 1 MB pages passed.
+ *
+ * Padding to 8 makes the stride divide every page size that is a power-of-two
+ * multiple of 32 bytes, so an entry is always wholly inside one page. It
+ * costs 25% more list bytes and removes a whole class of boundary handling.
+ * Real nbnxm gets the same property from struct alignment.
+ */
+constexpr int kCjPackedInts = 8;   // 6 used, 2 padding
+
+/** u64 slots of per-block global scratch: 2 for the page range, plus room
+ *  for kAtomsPerSc*3 staged float coordinates. */
+constexpr int kScratchU64PerBlock = 2 + (kAtomsPerSc * 3 + 1) / 2;
 
 /** Mirrors nbnxm_sci_t. */
 struct Sci {
@@ -125,17 +145,37 @@ __device__ gy::YCoroMain NbCoro(gv::DeviceVector<int> cjp,
   // GLOBAL, not __shared__: a co_await can exit the kernel and have the
   // driver relaunch this block, at which point shared memory is whatever the
   // new launch got. Two u64 per block.
-  u64 *pg_lo_s = scratch + static_cast<u64>(block) * 2;
+  // Per-block scratch: 2 u64 for the page range, then 64*3 floats for the
+  // staged i-supercluster coordinates. GLOBAL, not __shared__, because a
+  // co_await can exit the kernel and have this block relaunched.
+  u64 *pg_lo_s = scratch + static_cast<u64>(block) * kScratchU64PerBlock;
   u64 *pg_hi_s = pg_lo_s + 1;
+  float *xi_s = reinterpret_cast<float *>(pg_lo_s + 2);
 
   for (int s = block; s < numSci; s += nblocks) {
     const Sci sc = scis[s];
     const u64 i0 = static_cast<u64>(sc.sci) * kAtomsPerSc;
 
-    // The i-supercluster's coordinates, held once for the whole sci. A
-    // separate view so the j-side holds below cannot dislodge it.
-    gv::DeviceVector<float> xi = xq;
-    co_await xi.HoldPageCoro(i0 * 4, static_cast<u64>(kAtomsPerSc) * 4, &run);
+    // STAGE the i-supercluster's coordinates OUT of the page cache.
+    //
+    // xi and the j-side views share one page table, so holding a j-page can
+    // evict the i-page while the per-thread last_page_ still points at that
+    // slot -- now refilled with another page. Reading an i-atom through it
+    // then returns some other atom's coordinates.
+    //
+    // The config sweep is what exposed it: every configuration with a small
+    // cache (slots 2-3) and many pages failed, while slots 8 and a 1 MB page
+    // (one page for the whole array) passed. Copying the 64 atoms out once
+    // per sci removes the aliasing entirely -- the same fix the LAMMPS pair
+    // style needed, and the third time this hazard has appeared.
+    {
+      gv::DeviceVector<float> xi = xq;
+      co_await xi.HoldPageCoro(i0 * 4, static_cast<u64>(kAtomsPerSc) * 4, &run);
+      for (u32 t = threadIdx.x; t < kAtomsPerSc * 3; t += blockDim.x) {
+        xi_s[t] = xi.at(i0 * 4 + (t / 3) * 4 + (t % 3));
+      }
+      __syncthreads();
+    }
 
     // Stream this sci's slice of the packed list, page by page.
     const u64 k0 = static_cast<u64>(sc.cjPackedBegin) * kCjPackedInts;
@@ -146,11 +186,9 @@ __device__ gy::YCoroMain NbCoro(gv::DeviceVector<int> cjp,
       const u64 seg_end = ((off / pe) + 1) * pe < k1 ? ((off / pe) + 1) * pe : k1;
       co_await cjp.HoldPageCoro(off, seg_end - off, &run);
 
-      // Whole packed entries fully inside this page. An entry straddling the
-      // boundary is left to the segment that contains its start, which is
-      // why the loop below re-derives the entry index rather than assuming
-      // alignment.
-      const u64 first = (off + kCjPackedInts - 1) / kCjPackedInts;
+      // Entries are power-of-two sized (see kCjPackedInts), so every entry
+      // overlapping this page lies WHOLLY inside it and this range is exact.
+      const u64 first = off / kCjPackedInts;
       const u64 last = seg_end / kCjPackedInts;   // exclusive
 
       // PASS A: which coordinate pages do this segment's j-clusters touch?
@@ -201,15 +239,29 @@ __device__ gy::YCoroMain NbCoro(gv::DeviceVector<int> cjp,
               const u32 jslot = t % kJGroupSize;
               const int cj = cjp.at(base + jslot);
               if (cj < 0) continue;
-              const unsigned imask = static_cast<unsigned>(
-                  cjp.at(base + kJGroupSize + (ii / 32)));
+              // ONE 32-bit word: the bit index is jslot*8 + icluster, which
+              // is 4*8 = 32 bits exactly, so it never reaches the second
+              // word. Selecting the word by (ii / 32) -- as if the mask were
+              // indexed by i-ATOM rather than by i-CLUSTER -- read the second
+              // word for the upper 32 atoms, and that word is always zero.
+              // Exactly half the i-atoms were skipped, which showed up as an
+              // energy exactly half the reference's.
+              //
+              // GROMACS splits the mask across two warps (imei[2]); this
+              // harness keeps a single word and leaves the second reserved.
+              // That is a simplification of the real layout, not a claim to
+              // match it.
+              const unsigned imask =
+                  static_cast<unsigned>(cjp.at(base + kJGroupSize));
               const u32 icl = ii / kClusterSize;
               if (!((imask >> (jslot * kClustersPerSc + icl)) & 1u)) continue;
 
               const u64 ia = i0 + ii;
-              const float ix = xi.at(ia * 4 + 0);
-              const float iy = xi.at(ia * 4 + 1);
-              const float iz = xi.at(ia * 4 + 2);
+              // From scratch, not through the cache: the j-page hold above
+              // may well have evicted the page atom ia lives on.
+              const float ix = xi_s[ii * 3 + 0];
+              const float iy = xi_s[ii * 3 + 1];
+              const float iz = xi_s[ii * 3 + 2];
 
               for (int jj = 0; jj < kClusterSize; ++jj) {
                 const u64 ja = static_cast<u64>(cj) * kClusterSize + jj;
@@ -262,10 +314,320 @@ __global__ void NbKernel(clio::run::IpcManagerGpuInfo info,
 #endif  // ETERNIA_NB_CORO
 
 #if !CTP_IS_DEVICE_PASS
-int main(int argc, char **argv) {
-  std::printf("eternia nbnxm harness: scaffolding in place, kernel written.\n"
-              "Driver, CPU reference and sweep are the next step.\n");
-  (void)argc; (void)argv;
-  return 0;
-}
+
+#if defined(ETERNIA_NB_CORO)
+class YieldRunner {
+ public:
+  YieldRunner(unsigned nblocks, unsigned nthreads)
+      : drv_(nblocks, nthreads), stack_(nblocks, nthreads, kYieldLaneBytes) {}
+  template <typename LaunchT>
+  u32 Run(LaunchT &&launch) {
+    drv_.Reset();
+    stack_.Reset();
+    return drv_.RunToCompletion(
+        [&](dim3 g, dim3 b, gy::YieldableView<> v) { launch(g, b, v, stack_.View()); },
+        [] {}, /*max_rounds=*/2000000);
+  }
+
+ private:
+  gy::Yieldable<> drv_;
+  gy::YieldStack stack_;
+};
 #endif
+
+int main(int argc, char **argv) {
+  u64 nsc = 256;          // superclusters -> natoms = nsc * 64
+  double density = 0.8;
+  float cutoff = 2.5f;
+  u64 page_kb = 256;
+  u32 blocks = 32, threads = 128, slots = 8;
+  bool verify = true;
+  for (int i = 1; i < argc; ++i) {
+    const std::string a = argv[i];
+    auto next = [&]() { return static_cast<u64>(std::atoll(argv[++i])); };
+    if (a == "--sc") nsc = next();
+    else if (a == "--page-kb") page_kb = next();
+    else if (a == "--blocks") blocks = static_cast<u32>(next());
+    else if (a == "--threads") threads = static_cast<u32>(next());
+    else if (a == "--slots") slots = static_cast<u32>(next());
+    else if (a == "--cutoff") cutoff = static_cast<float>(std::atof(argv[++i]));
+    else if (a == "--no-verify") verify = false;
+    else {
+      std::fprintf(stderr, "usage: %s [--sc N] [--page-kb N] [--blocks N]\n"
+                           "          [--threads N] [--slots N] [--cutoff R]\n"
+                           "          [--no-verify]\n", argv[0]);
+      return 2;
+    }
+  }
+  const u64 natoms = nsc * kAtomsPerSc;
+  const u64 nclusters = natoms / kClusterSize;
+
+  // Atoms on a jittered lattice, laid out so cluster c holds atoms
+  // [c*8, c*8+8) that are spatially close -- which is what the real nbnxm
+  // grid produces and what makes paging pay.
+  std::vector<float> xq(natoms * 4);
+  // Cluster lattice: side^3 >= nclusters, so cluster c sits at
+  // (c%side, (c/side)%side, c/side^2). Making the CLUSTER grid cubic (rather
+  // than the atom grid) is what lets the neighbour list be enumerated
+  // analytically below instead of searched, which is the difference between
+  // O(nsc * nclusters) and O(nsc) host time -- and therefore between
+  // stopping at a few thousand atoms and reaching past VRAM.
+  const u64 side = static_cast<u64>(std::ceil(std::cbrt((double)nclusters)));
+  const double spacing = std::cbrt(1.0 / density);
+  {
+    unsigned sd = 7u;
+    auto rnd = [&]() { sd = sd * 1664525u + 1013904223u;
+                       return (float)(sd >> 8) / (float)(1u << 24); };
+    for (u64 a = 0; a < natoms; ++a) {
+      // Morton-ish: consecutive atoms stay near each other in space.
+      const u64 c = a / kClusterSize;
+      const u64 cx = c % side, cy = (c / side) % side, cz = c / (side * side);
+      (void)0;
+      const u64 l = a % kClusterSize;
+      xq[a * 4 + 0] = (float)((cx + 0.5 * (l & 1)) * spacing) + 0.01f * rnd();
+      xq[a * 4 + 1] = (float)((cy + 0.5 * ((l >> 1) & 1)) * spacing) + 0.01f * rnd();
+      xq[a * 4 + 2] = (float)((cz + 0.5 * ((l >> 2) & 1)) * spacing) + 0.01f * rnd();
+      xq[a * 4 + 3] = 0.0f;
+    }
+  }
+
+  // Cluster bounding centres, for a cheap pair search.
+  std::vector<float> cc(nclusters * 3, 0.0f);
+  for (u64 c = 0; c < nclusters; ++c) {
+    for (int l = 0; l < kClusterSize; ++l)
+      for (int d = 0; d < 3; ++d) cc[c * 3 + d] += xq[(c * kClusterSize + l) * 4 + d];
+    for (int d = 0; d < 3; ++d) cc[c * 3 + d] /= kClusterSize;
+  }
+
+  // Build the packed pair list. SYMMETRIC (each cluster pair appears from
+  // both sides), which is what makes sum(f) == 0 a real invariant below.
+  const float searchSq = (cutoff + 2.0f * (float)spacing) * (cutoff + 2.0f * (float)spacing);
+  std::vector<Sci> scis;
+  std::vector<int> cjp;   // flattened: kCjPackedInts ints per entry
+  for (u64 s = 0; s < nsc; ++s) {
+    Sci sc{};
+    sc.sci = (int)s; sc.shift = 0;
+    sc.cjPackedBegin = (int)(cjp.size() / kCjPackedInts);
+    std::vector<int> js;
+    // Analytic neighbours: the i-supercluster's 8 clusters occupy a known
+    // lattice span, and any cluster within R lattice steps of it is a
+    // candidate. Enumerating that box is linear in the result size; the
+    // earlier all-pairs scan was quadratic and could not have reached the
+    // sizes this exists to test.
+    {
+      const int R = (int)std::ceil((cutoff + 2.0 * spacing) / spacing);
+      long lo[3] = {LONG_MAX, LONG_MAX, LONG_MAX};
+      long hi[3] = {LONG_MIN, LONG_MIN, LONG_MIN};
+      for (int ic = 0; ic < kClustersPerSc; ++ic) {
+        const u64 icl = s * kClustersPerSc + ic;
+        if (icl >= nclusters) continue;
+        const long p[3] = {(long)(icl % side), (long)((icl / side) % side),
+                           (long)(icl / (side * side))};
+        for (int d = 0; d < 3; ++d) {
+          lo[d] = std::min(lo[d], p[d]); hi[d] = std::max(hi[d], p[d]);
+        }
+      }
+      for (long z = lo[2] - R; z <= hi[2] + R; ++z) {
+        if (z < 0 || z >= (long)side) continue;
+        for (long y = lo[1] - R; y <= hi[1] + R; ++y) {
+          if (y < 0 || y >= (long)side) continue;
+          for (long x = lo[0] - R; x <= hi[0] + R; ++x) {
+            if (x < 0 || x >= (long)side) continue;
+            const u64 jc = (u64)x + (u64)y * side + (u64)z * side * side;
+            if (jc < nclusters) js.push_back((int)jc);
+          }
+        }
+      }
+    }
+    for (size_t b = 0; b < js.size(); b += kJGroupSize) {
+      int cjv[kJGroupSize];
+      for (int q = 0; q < kJGroupSize; ++q)
+        cjv[q] = (b + q < js.size()) ? js[b + q] : -1;
+      unsigned im[2] = {0u, 0u};
+      for (int q = 0; q < kJGroupSize; ++q) {
+        if (cjv[q] < 0) continue;
+        for (int ic = 0; ic < kClustersPerSc; ++ic) {
+          const int bit = q * kClustersPerSc + ic;
+          im[ic / 4 >= 4 ? 1 : 0] |= 0u;      // keep both words defined
+          if (bit < 32) im[0] |= (1u << bit); else im[1] |= (1u << (bit - 32));
+        }
+      }
+      for (int q = 0; q < kJGroupSize; ++q) cjp.push_back(cjv[q]);
+      cjp.push_back((int)im[0]);
+      cjp.push_back((int)im[1]);
+      for (int q = kJGroupSize + 2; q < kCjPackedInts; ++q) cjp.push_back(0);
+    }
+    sc.cjPackedEnd = (int)(cjp.size() / kCjPackedInts);
+    scis.push_back(sc);
+  }
+
+  const double list_gib = (double)cjp.size() * sizeof(int) / (1024.0*1024.0*1024.0);
+  const double xq_gib = (double)xq.size() * sizeof(float) / (1024.0*1024.0*1024.0);
+  std::printf("GROMACS nbnxm nonbonded over an Eternia pair list\n"
+              "  atoms=%llu clusters=%llu superclusters=%llu\n"
+              "  cjPacked=%llu entries = %.3f GiB | xq = %.3f GiB | total %.3f GiB\n"
+              "  page=%lluKB blocks=%u threads=%u slots=%u cutoff=%.2f\n",
+              (unsigned long long)natoms, (unsigned long long)nclusters,
+              (unsigned long long)nsc,
+              (unsigned long long)(cjp.size() / kCjPackedInts), list_gib, xq_gib,
+              list_gib + xq_gib, (unsigned long long)page_kb, blocks, threads,
+              slots, cutoff);
+
+#if !defined(ETERNIA_NB_CORO)
+  std::fprintf(stderr, "built without CUDA + clang device coroutines\n");
+  return 1;
+#else
+  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true)) return 1;
+  if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) return 1;
+  auto gpu = CLIO_CPU_IPC->GetGpuIpcManager()->GetGpuInfo(0);
+
+  gv::Vector<int> vcj("gmx_eternia_nb_cj", {0}, page_kb * 1024, blocks, slots,
+                      cjp.size());
+  gv::Vector<float> vxq("gmx_eternia_nb_xq", {0}, page_kb * 1024, blocks, slots,
+                        xq.size());
+  vcj.EnableStats();
+  vxq.EnableStats();
+
+  clio::cte::core::Client core(clio::cte::core::kCtePoolId);
+  auto seed = [&](auto &vec, const auto &host, u64 esz) {
+    const u64 pe = (page_kb * 1024) / esz;
+    const u64 np = (host.size() + pe - 1) / pe;
+    std::vector<char> buf(page_kb * 1024);
+    for (u64 p = 0; p < np; ++p) {
+      std::memset(buf.data(), 0, buf.size());
+      const u64 lo = p * pe, hi = std::min(lo + pe, (u64)host.size());
+      std::memcpy(buf.data(), host.data() + lo, (hi - lo) * esz);
+      char nm[32]; gv::PageBlobName(p, nm);
+      auto f2 = core.AsyncPutBlob(vec.TagId(), std::string(nm), 0, buf.size(),
+                                  buf.data(), 1.0f);
+      f2.Wait();
+      if (f2.get() == nullptr || f2->GetReturnCode() != 0) {
+        std::fprintf(stderr, "seed failed at page %llu\n", (unsigned long long)p);
+        std::exit(1);
+      }
+    }
+  };
+  seed(vcj, cjp, sizeof(int));
+  seed(vxq, xq, sizeof(float));
+
+  Sci *dsci = nullptr; float *df = nullptr; double *de = nullptr;
+  unsigned long long *dp = nullptr; u64 *dscratch = nullptr;
+  cudaMalloc(&dsci, scis.size() * sizeof(Sci));
+  cudaMemcpy(dsci, scis.data(), scis.size() * sizeof(Sci), cudaMemcpyHostToDevice);
+  cudaMalloc(&df, natoms * 4 * sizeof(float));
+  cudaMemset(df, 0, natoms * 4 * sizeof(float));
+  cudaMalloc(&de, sizeof(double)); cudaMemset(de, 0, sizeof(double));
+  cudaMalloc(&dp, sizeof(unsigned long long)); cudaMemset(dp, 0, sizeof(unsigned long long));
+  cudaMalloc(&dscratch, (u64)blocks * kScratchU64PerBlock * sizeof(u64));
+
+  NbParams prm{cutoff * cutoff, 1.0f, 1.0f};
+  auto dcj = vcj.GetDevice(0);
+  auto dxq = vxq.GetDevice(0);
+  using clock = std::chrono::high_resolution_clock;
+  const auto t0 = clock::now();
+  YieldRunner runner(blocks, threads);
+  const u32 rounds = runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> v,
+                                    gy::YieldStackView sv) {
+    NbKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, dcj, dxq, df, dsci,
+                                              (int)scis.size(), prm, de, dp,
+                                              dscratch, blocks, v, sv);
+  });
+  const cudaError_t le = cudaGetLastError();
+  if (le != cudaSuccess) { std::fprintf(stderr, "LAUNCH FAILED: %s\n",
+                                        cudaGetErrorString(le)); return 1; }
+  if (cudaDeviceSynchronize() != cudaSuccess) {
+    std::fprintf(stderr, "kernel failed: %s\n",
+                 cudaGetErrorString(cudaGetLastError())); return 1; }
+  const double ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
+
+  std::vector<float> hf(natoms * 4);
+  double he = 0.0; unsigned long long hp = 0;
+  cudaMemcpy(hf.data(), df, hf.size() * sizeof(float), cudaMemcpyDeviceToHost);
+  cudaMemcpy(&he, de, sizeof(double), cudaMemcpyDeviceToHost);
+  cudaMemcpy(&hp, dp, sizeof(unsigned long long), cudaMemcpyDeviceToHost);
+
+  const auto sc1 = vcj.ReadStats(0);
+  const auto sc2 = vxq.ReadStats(0);
+  std::printf("  nb: %.1f ms rounds=%u | list faults=%llu evicts=%llu | "
+              "xq faults=%llu evicts=%llu | get_err=%llu | pairs=%llu\n",
+              ms, rounds, (unsigned long long)sc1.faults,
+              (unsigned long long)sc1.evicts, (unsigned long long)sc2.faults,
+              (unsigned long long)sc2.evicts,
+              (unsigned long long)(sc1.get_errors + sc2.get_errors),
+              (unsigned long long)hp);
+  if (sc1.get_errors || sc2.get_errors) {
+    std::fprintf(stderr, "FAIL: failed page reads\n"); return 1; }
+
+  // NEWTON'S THIRD LAW: an INDEPENDENT invariant. The list is symmetric, so
+  // every pair is evaluated from both sides and the total force must cancel.
+  // A reference sharing the kernel's arithmetic cannot catch an error in that
+  // arithmetic; this can.
+  double fsum[3] = {0, 0, 0}, fmag = 0.0, fabs_sum = 0.0;
+  for (u64 a = 0; a < natoms; ++a) {
+    for (int d = 0; d < 3; ++d) {
+      fsum[d] += hf[a * 4 + d];
+      fabs_sum += std::fabs((double)hf[a * 4 + d]);
+    }
+    fmag = std::max(fmag, (double)std::fabs(hf[a * 4 + 0]));
+  }
+  const double fres = std::sqrt(fsum[0]*fsum[0] + fsum[1]*fsum[1] + fsum[2]*fsum[2]);
+  // RELATIVE, not absolute. |sum f| is a cancelling sum of N float forces, so
+  // its absolute size grows with the system while the underlying error per
+  // term does not. Measured across three sizes, |sum f| / sum|f| sits at
+  // 4.5e-08, 5.6e-08 and 6.3e-08 for 4k, 262k and 4.2M atoms -- flat, and
+  // plainly float epsilon. An absolute threshold (the first version used
+  // 1e-3 * peak) has no N in it and therefore fails every large run for
+  // reasons that have nothing to do with the kernel.
+  const double fratio = fres / std::max(fabs_sum, 1e-30);
+  std::printf("  newton3: |sum f| = %.4e  sum|f| = %.4e  ratio = %.3e\n",
+              fres, fabs_sum, fratio);
+
+  bool ok = true;
+  if (verify) {
+    std::vector<double> rf(natoms * 3, 0.0);
+    double re = 0.0;
+    for (const Sci &sc : scis) {
+      for (int e = sc.cjPackedBegin; e < sc.cjPackedEnd; ++e) {
+        const int *ent = &cjp[(size_t)e * kCjPackedInts];
+        for (int q = 0; q < kJGroupSize; ++q) {
+          const int cj = ent[q];
+          if (cj < 0) continue;
+          for (int ii = 0; ii < kAtomsPerSc; ++ii) {
+            const int bit = q * kClustersPerSc + (ii / kClusterSize);
+            const unsigned w = (unsigned)ent[kJGroupSize];
+            if (!((w >> bit) & 1u)) continue;
+            const u64 ia = (u64)sc.sci * kAtomsPerSc + ii;
+            for (int jj = 0; jj < kClusterSize; ++jj) {
+              const u64 ja = (u64)cj * kClusterSize + jj;
+              if (ja == ia) continue;
+              float d[3];
+              for (int t = 0; t < 3; ++t) d[t] = xq[ia*4+t] - xq[ja*4+t];
+              const float rsq = d[0]*d[0] + d[1]*d[1] + d[2]*d[2];
+              if (rsq >= prm.cutoffSq || rsq == 0.0f) continue;
+              float fs, en; LjPair(rsq, prm, &fs, &en);
+              re += 0.5 * en;
+              for (int t = 0; t < 3; ++t) rf[ia*3+t] += d[t] * fs;
+            }
+          }
+        }
+      }
+    }
+    double maxd = 0.0, peak = 0.0;
+    for (u64 a = 0; a < natoms; ++a)
+      for (int t = 0; t < 3; ++t) {
+        peak = std::max(peak, std::fabs(rf[a*3+t]));
+        maxd = std::max(maxd, std::fabs(rf[a*3+t] - (double)hf[a*4+t]));
+      }
+    const double tol = 1e-4 * std::max(peak, 1.0);
+    std::printf("  verify: max|df|=%.4e peak=%.4e tol=%.4e | E %.9g vs %.9g\n",
+                maxd, peak, tol, he, re);
+    ok = ok && (maxd <= tol) && (std::fabs(he - re) <= 1e-4 * std::max(std::fabs(re), 1.0));
+  }
+  const double ftol = 1e-6;   // relative; see above
+  ok = ok && (fratio <= ftol);
+  (void)fmag;
+  std::printf("%s\n", ok ? "PASS" : "FAIL");
+  return ok ? 0 : 1;
+#endif
+}
+#endif  // !CTP_IS_DEVICE_PASS
