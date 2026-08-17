@@ -149,6 +149,34 @@ coordinates, charges and grid geometry, compute splines internally, produce
 the grid. That is what this kernel does, and it is why the spline had to
 match GROMACS's exactly rather than merely be spline-shaped.
 
+## The nonbonded path, larger than VRAM
+
+Unlike the PME grid above, this one composes: the consumer is local force
+accumulation, so nothing downstream demands the whole array back.
+
+On an 8 GiB (7.99 GiB usable) RTX 4070 Laptop:
+
+| atoms      | pair list     | xq       | total         | kernel  | result |
+|------------|---------------|----------|---------------|---------|--------|
+| 4,194,304  | 1.03 GiB      | 0.06 GiB | 1.41 GiB      | 243 s   | PASS   |
+| 35,200,000 | 10.38 GiB     | 0.53 GiB | **10.90 GiB** | 2,990 s | PASS   |
+
+The large run evaluated 712,463,819,264 pair interactions across 151,910
+scheduler rounds, with 592,431 pair-list faults and 8,540,745 coordinate
+faults, and zero failed page reads. Resident GPU memory during the run was
+4,363 MiB against a 10.90 GiB dataset -- the GPU held about 40% of the data
+at any moment.
+
+Correctness at that size is the Newton's-third-law ratio, |sum f| / sum|f|,
+which is 4.43e-08 -- in line with 1.67e-08, 3.24e-08 and 4.08e-08 at 4k,
+262k and 4.2M atoms. Flat across four orders of magnitude in system size is
+what an epsilon-level residual looks like; a dropped or double-counted
+interaction would not sit there.
+
+The CPU reference is not run at this size (it is O(pairs), and 712 billion of
+them is not a check, it is a second experiment). The reference covers the
+sweep at small sizes; the invariant covers the large ones.
+
 ## Next
 
 Wire this into GROMACS proper: replace `pme_gpu_spread` and the matching
