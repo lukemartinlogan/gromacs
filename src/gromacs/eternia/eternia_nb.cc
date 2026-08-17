@@ -258,10 +258,7 @@ __device__ gy::YCoroMain NbCoro(gv::DeviceVector<int> cjp,
                 const u32 jslot = t % kJGroupSize;
                 const int cj = cjp.at(base + jslot);
                 if (cj < 0) continue;
-                const unsigned imask =
-                    static_cast<unsigned>(cjp.at(base + kJGroupSize));
                 const u32 icl = ii / kClusterSize;
-                if (!((imask >> (jslot * kClustersPerSc + icl)) & 1u)) continue;
 
                 const u64 ia = i0 + ii;
                 const float ix = xi_s[ii * 3 + 0];
@@ -269,6 +266,16 @@ __device__ gy::YCoroMain NbCoro(gv::DeviceVector<int> cjp,
                 const float iz = xi_s[ii * 3 + 2];
 
                 for (int jj = 0; jj < kClusterSize; ++jj) {
+                  // TWO mask words, not one. nbnxm splits a cluster pair
+                  // across two warps (imei[c_clusterPairSplit]) and each warp
+                  // owns half of the j-cluster's atoms, so the two words can
+                  // differ once pruning has run. Using imei[0] for all eight
+                  // j-atoms -- which the standalone bench did, and said so --
+                  // both keeps pairs the second warp pruned and drops pairs
+                  // it kept.
+                  const unsigned imask = static_cast<unsigned>(cjp.at(
+                      base + kJGroupSize + (jj >= kClusterSize / 2 ? 1 : 0)));
+                  if (!((imask >> (jslot * kClustersPerSc + icl)) & 1u)) continue;
                   const u64 ja = static_cast<u64>(cj) * kClusterSize + jj;
                   if (ja == ia) continue;
                   const u64 jo = ja * 4;
@@ -453,7 +460,9 @@ bool Upload(Context* ctx, const int* cj, const unsigned* imask,
         cj[static_cast<size_t>(e) * kJGroupSize + q];
     }
     flat[static_cast<size_t>(e) * kCjPackedInts + kJGroupSize] =
-      static_cast<int>(imask[e]);
+      static_cast<int>(imask[static_cast<size_t>(e) * 2 + 0]);
+    flat[static_cast<size_t>(e) * kCjPackedInts + kJGroupSize + 1] =
+      static_cast<int>(imask[static_cast<size_t>(e) * 2 + 1]);
   }
   if (!SeedVector(*ctx->vcj, flat, ctx->cfg.page_bytes)) {
     SetErr("Upload: pair-list page write failed"); return false;

@@ -87,7 +87,9 @@ void Destroy(Context* ctx);
  * Copy the pair list and coordinates into the CTE, page by page.
  *
  * @param cj        numCjPacked * jGroupSize ints, the j-cluster indices
- * @param imask     numCjPacked ints, one mask word per packed entry
+ * @param imask     numCjPacked * 2 words: nbnxm splits a cluster pair across
+ *                  two warps (imei[c_clusterPairSplit]) and each warp owns
+ *                  half of the j-cluster's atoms, so BOTH words are needed
  * @param xq        natoms * 4 floats, x/y/z/charge, as nbnxm stores it
  *
  * Page by page so the host never needs a second resident copy of an array

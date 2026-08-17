@@ -577,14 +577,17 @@ void eterniaCompareForces(NbnxmGpu* nb, const InteractionLocality iloc)
                          *nb->deviceStreams[iloc], GpuApiCallBehavior::Sync, nullptr);
 
     std::vector<int>      cj(static_cast<size_t>(numCjP) * c_jGroupSize);
-    std::vector<unsigned> imask(numCjP);
+    std::vector<unsigned> imask(static_cast<size_t>(numCjP) * 2);
     for (int e = 0; e < numCjP; ++e)
     {
         for (int q = 0; q < c_jGroupSize; ++q)
         {
             cj[static_cast<size_t>(e) * c_jGroupSize + q] = hCjp[e].cj[q];
         }
-        imask[e] = hCjp[e].imei[0].imask;
+        // Both warps' masks: each owns half of the j-cluster's atoms.
+        imask[static_cast<size_t>(e) * 2 + 0] = hCjp[e].imei[0].imask;
+        imask[static_cast<size_t>(e) * 2 + 1] =
+            (c_clusterSplitSize > 1) ? hCjp[e].imei[1].imask : hCjp[e].imei[0].imask;
     }
     std::vector<eternia_gmx::Sci> sci(numSci);
     for (int i = 0; i < numSci; ++i)
