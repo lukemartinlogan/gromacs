@@ -339,9 +339,29 @@ __device__ gy::YCoroMain NbCoro(gv::DeviceVector<int> cjp,
                   // No halving: nbnxm lists each unordered pair once, so
                   // every pair reached here is counted exactly once already.
                   e_local += static_cast<double>(ener);
+                  // BOTH sides of the pair. nbnxm lists each unordered pair
+                  // ONCE, so an atom receives a contribution here only for the
+                  // pairs in which it is the i-atom -- adding just the i-side
+                  // leaves every atom short of most of its force. That is not
+                  // an approximation, it is a different quantity: the array
+                  // then violates Newton's third law outright (|sum f|/sum|f|
+                  // measured at 0.265 rather than ~1e-7) and is nonzero on a
+                  // perfect lattice, where the exact force is zero.
+                  //
+                  // It went unnoticed because nothing read the array -- the
+                  // hook reported only the energy, which is correct, and the
+                  // standalone bench enumerates each pair from both sides
+                  // (note its 0.5 * ener) so it never had the problem.
+                  //
+                  // Safe as a cross-block atomicAdd because f is RESIDENT. A
+                  // paged force array could not do this: two blocks would
+                  // cache the same page separately and each flush its own copy.
                   atomicAdd(&f[ia * 4 + 0], dx * fscal);
                   atomicAdd(&f[ia * 4 + 1], dy * fscal);
                   atomicAdd(&f[ia * 4 + 2], dz * fscal);
+                  atomicAdd(&f[ja * 4 + 0], -dx * fscal);
+                  atomicAdd(&f[ja * 4 + 1], -dy * fscal);
+                  atomicAdd(&f[ja * 4 + 2], -dz * fscal);
                 }
               }
             }

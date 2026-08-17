@@ -47,6 +47,8 @@
 #    include <cstdlib>
 #    include <vector>
 
+#    include <cmath>
+#    include <vector>
 #    include "eternia_nb.h"
 #endif
 
@@ -659,6 +661,40 @@ void eterniaCompareForces(NbnxmGpu* nb, const InteractionLocality iloc)
     }
     else
     {
+        // The force array was computed and then thrown away: only the energy
+        // was ever reported, so nothing in this hook checked the forces at all
+        // -- and an energy can be right while forces are wrong, since the
+        // energy is a scalar sum over pairs and the forces are per-atom
+        // vectors. Summarise them so the harness has something to check.
+        //
+        // Two summaries, because they fail differently. |sum f| / sum|f| is
+        // Newton's third law: nbnxm lists each pair once and this kernel adds
+        // an equal and opposite contribution, so the total must cancel. It is
+        // necessary but NOT sufficient -- scaling every force by a constant
+        // still cancels. max|f| is the one that catches that, because the
+        // generated argon configuration is a perfect lattice, where every atom
+        // sits at a symmetry point and the exact force on it is ZERO.
+        std::vector<float> hf(static_cast<size_t>(nAtoms) * 4);
+        cudaMemcpy(hf.data(), dF, hf.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        double fsum[3] = { 0.0, 0.0, 0.0 };
+        double fabs_sum = 0.0, fmax = 0.0;
+        for (int a = 0; a < nAtoms; ++a)
+        {
+            for (int d = 0; d < 3; ++d)
+            {
+                const double v = hf[static_cast<size_t>(a) * 4 + d];
+                fsum[d] += v;
+                fabs_sum += std::fabs(v);
+                fmax = std::max(fmax, std::fabs(v));
+            }
+        }
+        const double fnet = std::sqrt(fsum[0] * fsum[0] + fsum[1] * fsum[1] + fsum[2] * fsum[2]);
+        // Relative: |sum f| is a cancelling sum of N single-precision terms, so
+        // an absolute tolerance would just be a disguised atom-count threshold.
+        const double fratio = (fabs_sum > 0.0) ? (fnet / fabs_sum) : 0.0;
+        std::fprintf(stderr, "[eternia] force check: max|f|=%.6g  |sum f|/sum|f|=%.3e\n",
+                     fmax, fratio);
+
         const auto st = eternia_gmx::GetStats(ctx);
         // A failed page read means some pairs were computed from data that
         // never arrived, so the energy is wrong -- but it is wrong by however

@@ -375,6 +375,50 @@ This is the same class of defect as the LBANN half's fallback-to-El::Gemm under
 own-weights: a degraded path that reports success. It was worth looking for
 here specifically because that one was found there.
 
+### The force array was computing half of each pair
+
+Found by auditing which arrays go through eternia primitives, and then asking
+what the one array nobody looked at actually contained.
+
+The kernel accumulated only the i-side of each pair:
+
+    atomicAdd(&f[ia * 4 + d],  d_ * fscal);   // and nothing on ja
+
+nbnxm lists each unordered pair ONCE, so an atom received a contribution only
+for the pairs in which it happened to be the i-atom. The result was not an
+approximate force, it was a different quantity -- roughly half of each atom's
+force, with no fixed relationship to the true one.
+
+Nothing caught it because nothing read the array. `eterniaCompareForces`
+allocated the buffer, passed it to the kernel, and freed it; only the energy
+was ever reported, and the energy was correct. The standalone bench did not
+have the bug at all, because it enumerates every pair from both sides (note its
+`0.5 * ener`), so an i-side-only accumulation is complete there.
+
+The fix is the reaction force, `atomicAdd(&f[ja * 4 + d], -d_ * fscal)`, which
+is safe here precisely BECAUSE the force array is resident -- see the audit note
+below on why it could not be paged as the kernel is decomposed today.
+
+The hook now also summarises the forces instead of discarding them, and the two
+summaries fail differently:
+
+| | before | after |
+|---|--------|-------|
+| `max\|f\|` at step 0 (perfect lattice, exact force = 0) | 53.3 | **0.00074** |
+| `\|sum f\|/sum\|f\|` at steps 1-2 (Newton's third law) | 0.265 | **5.1e-08 / 2.1e-08** |
+
+`max|f|` is the one that mattered. Newton's third law alone would not have
+caught a uniformly scaled force, and the generated configuration is a perfect
+lattice where every atom sits at a symmetry point, so the exact force on it is
+zero -- an exact reference, free.
+
+The energy is unchanged (-8491.76907), which is the expected result and worth
+stating: the bug was confined to an array the energy never touched.
+
+Note that at step 0 the RATIO reads 1.2e-03 while the forces are essentially
+zero. That is the scale-blind trap again -- the denominator is a sum of
+near-zero terms. Read `max|f|` at step 0 and the ratio afterwards.
+
 ### Reading the `pairs` counter
 
 The same run reports `pairs=23220000`, while only 9,936,000 atom pairs lie
