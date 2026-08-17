@@ -15,6 +15,12 @@ set -e
 CELLS=${1:-12}
 NSTEPS=${2:-10}
 
+# Both inputs are copied into the working directory, not read in place:
+# make_argon.py reads topol.top from the CURRENT directory and rewrites it with
+# the atom count it just generated, so running the script from anywhere other
+# than its own directory failed on a missing topol.top -- and running it from
+# its own directory would edit a tracked file.
+cp "$(dirname "$0")/topol.top" topol.top
 python3 "$(dirname "$0")/make_argon.py" "$CELLS"
 cp "$(dirname "$0")/md10.mdp" md.mdp
 sed -i "s/^nsteps .*/nsteps          = $NSTEPS/" md.mdp
