@@ -329,36 +329,42 @@ a real substitution would bound the nonbonded memory by the page cache. At
 these sizes there would be nothing to collect: the coordinates are 3.5 MB at
 216,000 atoms. The regime where it would matter is a list of many GB.
 
-## A discrepancy at 216,000 atoms, and why it is probably not ours
+## A discrepancy at 216,000 atoms -- resolved, and not ours
 
 At 216,000 atoms the two disagree for the first time: -1061470.96 against
 GROMACS's -1.06145e+06, about 2e-5 relative. Every smaller system agreed to all
 six digits GROMACS prints.
 
-The evidence says the paged kernel is the self-consistent one:
+This is settled by an exact reference rather than by argument. `md10.mdp` sets
+`vdw-modifier = none`, `rvdw = 1.0` and `DispCorr = no`, so the energy is plain
+truncated LJ; and `make_argon.py` builds a perfect cubic lattice, so the
+per-atom energy is a finite lattice sum over the 92 neighbours within the
+cutoff, computable exactly in double precision:
 
-| atoms   | GROMACS per atom | eternia per atom |
-|---------|------------------|------------------|
-| 1,728   | -4.914213        | -4.914218 |
-| 8,000   | -4.914225        | -4.914219 |
-| 216,000 | -4.914120        | -4.914217 |
+| | per-atom energy | error vs exact |
+|---|---|---|
+| **exact lattice sum** | **-4.914218** | -- |
+| eternia paged kernel  | -4.914217 | 9.3e-07 |
+| GROMACS               | -4.914120 | 9.8e-05 |
 
-`make_argon.py` builds a PERFECT cubic lattice -- deterministic, no jitter,
-fixed spacing -- and the cutoff fits inside half the box at every size. The
-per-atom energy is therefore required to be size-independent. eternia's is,
-to six digits across a 125x range. GROMACS's moves, and only at the largest
-pair count.
+The paged kernel is right to the precision its output is printed at. GROMACS is
+100x further off, and only at the largest pair count -- it accumulates 23.2
+million pair terms in `float` in a mixed-precision build, while this kernel
+sums each i-atom's contributions in `double`.
 
-The likely cause is accumulation precision, not paging: this kernel sums each
-i-atom's contributions in `double`, while GROMACS is a mixed-precision build
-summing 23.2 million pair terms in `float`. The deviation grows with pair
-count (1.1e-06 at 0.86M pairs, 2.0e-05 at 23.2M), which is the shape of
-accumulation error rather than of a geometry or list bug.
+So the divergence is GROMACS's accumulation error, and the agreement at smaller
+sizes was not luck: there the error is below the printed precision. An earlier
+revision of this file proposed settling this with a `-DGMX_DOUBLE=ON` build.
+That would not have worked -- GROMACS does not support double precision with
+the CUDA nonbonded kernels -- and the lattice sum is both cheaper and exact.
 
-This is stated as the likely cause rather than the established one. The way to
-settle it is a double-precision GROMACS build (`-DGMX_DOUBLE=ON`), which has
-not been run here -- until then it remains an argument from invariance, not a
-measurement.
+### Reading the `pairs` counter
+
+The same run reports `pairs=23220000`, while only 9,936,000 atom pairs lie
+within the cutoff (216,000 x 92 / 2). The counter measures cluster-pair
+candidates evaluated, before the per-pair cutoff test, not interactions
+included in the energy. It is a paging/work metric, not a physics one, and
+should not be compared against a neighbour count.
 
 ## Re-verified
 
