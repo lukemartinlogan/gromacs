@@ -299,9 +299,38 @@ STANDALONE bench proves the same kernel scales past VRAM, at 10.90 GiB with
 712 billion pair interactions. Neither claim is made on the other's
 evidence.
 
+## Re-verified
+
+Independently of the numbers above, the whole comparison was re-run from a
+clean working directory at 8000 atoms (20 cells, 5 steps) with a 128 KiB cache
+(`PAGE_KB=4 BLOCKS=16 SLOTS=2`) against 128 KiB of coordinates:
+
+| GROMACS `LJ(SR)` | eternia paged |
+|------------------|---------------|
+| -3.93138e+04     | -39313.7556   |
+| -3.93123e+04     | -39312.3232   |
+| -3.93080e+04     | -39308.0243   |
+| -3.93008e+04     | -39300.8627   |
+| -3.92908e+04     | -39290.8435   |
+| -3.92779e+04     | -39277.9730   |
+
+Every step agrees to all six digits GROMACS prints, over 860,000 pairs, with
+`get_err=0` and the coordinate cache turning over almost completely:
+1386 faults against 1354 evictions.
+
 ## Next
 
-Wire this into GROMACS proper: replace `pme_gpu_spread` and the matching
-gather with the paged kernels behind a runtime switch, and validate against
-`gmx nonbonded-benchmark` / a PME regression test rather than a synthetic
-reference.
+NOT PME. The earlier plan here was to replace `pme_gpu_spread` and the matching
+gather, and that was abandoned on evidence: paging only lifts a memory ceiling
+if whatever CONSUMES the array can stream it too, and PME's consumer is a cuFFT
+3D transform that needs the whole real and complex grid resident the moment
+spread finishes. See the PME section above -- the spread demo stands as a
+demonstration, not as a route to out-of-core PME.
+
+What would actually advance this: the nonbonded kernel currently runs ALONGSIDE
+nbnxm's own for comparison rather than in place of it, and it implements only
+plain LJ -- no electrostatics, no per-atom exclusions beyond the cluster imask,
+no switch/shift modifiers, no free-energy paths. Substituting it for the
+production kernel means implementing those, and validating against
+`gmx nonbonded-benchmark` and the regression suite rather than a synthetic
+argon reference.
