@@ -275,10 +275,17 @@ The hook copies them into the CTE; it does not change where GROMACS keeps
 them. So a system whose pair list exceeds VRAM fails in GROMACS's own
 allocator, and the paged kernel never sees it.
 
-The LBANN half of this project measured the same limitation directly: with
-its paged path enabled, an 8.00 GiB weight matrix still failed with "out of
-memory (8589934592 bytes requested, 8032092160 bytes available)", because
-LBANN allocates the weights in VRAM regardless.
+The LBANN half of this project hit the same limitation and then got PAST it,
+which is the useful comparison. An 8.00 GiB weight matrix failed there too,
+for the same reason -- LBANN allocated the weights in VRAM regardless of what
+the layer did. It took two further changes to fix: holding the weights on the
+host, and letting the paged store own them so the optimizer never reassembles
+a resident copy. With both, peak VRAM at a 1 GiB weight matrix drops from
+4298 MiB to 1326 MiB.
+
+Nothing equivalent has been done here. GROMACS still allocates the pair list
+and coordinates itself, so this hook cannot save memory no matter how well the
+kernel pages -- the same trap, at the stage LBANN has since moved past.
 
 What is validated here is therefore that the paged kernel reproduces nbnxm
 EXACTLY, on nbnxm's own data, across MD steps, under heavy eviction. What is
