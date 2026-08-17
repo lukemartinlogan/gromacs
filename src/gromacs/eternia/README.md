@@ -267,15 +267,30 @@ today and stops the obvious optimisation (cache the context across steps)
 from silently reintroducing staleness. The LBANN integration made exactly
 that mistake and served the first call's weights for a whole training run.
 
-### Why the in-application runs stop short of VRAM
+### IMPORTANT: the integration does not lift GROMACS's VRAM ceiling
 
-The paged arrays measure 0.142 pair-list entries per atom (1728 -> 266,
-110,592 -> 15,710), so at 32 bytes per padded entry plus a float4 of
-coordinates the footprint is about 20.5 bytes per atom. Exceeding this
-machine's 7.99 GiB of VRAM therefore needs roughly **418 million atoms**, and
-GROMACS's own host-side structures for a system that size would want tens of
-GiB before the pair list is even built. That is a limit of the box, not of
-the kernel.
+nbnxm allocates the coordinates and the pair list itself -- `adat->xq` and
+`plist->cjPacked` are DeviceBuffers, in VRAM, built before this hook runs.
+The hook copies them into the CTE; it does not change where GROMACS keeps
+them. So a system whose pair list exceeds VRAM fails in GROMACS's own
+allocator, and the paged kernel never sees it.
+
+The LBANN half of this project measured the same limitation directly: with
+its paged path enabled, an 8.00 GiB weight matrix still failed with "out of
+memory (8589934592 bytes requested, 8032092160 bytes available)", because
+LBANN allocates the weights in VRAM regardless.
+
+What is validated here is therefore that the paged kernel reproduces nbnxm
+EXACTLY, on nbnxm's own data, across MD steps, under heavy eviction. What is
+validated separately, by the standalone bench, is that the same kernel scales
+past VRAM when the data lives only in the CTE. Both are true; neither implies
+the other.
+
+For reference, the size at which the paged arrays alone would exceed VRAM:
+they measure 0.142 pair-list entries per atom (1728 -> 266, 110,592 ->
+15,710), so at 32 bytes per padded entry plus a float4 of coordinates the
+footprint is about 20.5 bytes per atom, and 7.99 GiB is roughly 418 million
+atoms. GROMACS would exhaust both host and device memory well before that.
 
 So the two halves of the evidence are deliberately different runs: the
 IN-APPLICATION runs prove the kernel reproduces nbnxm exactly, including
