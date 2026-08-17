@@ -243,6 +243,30 @@ Scaled up, at 110,592 atoms with the same tiny cache:
 
 against a GROMACS reference of -543472, again 2e-6 relative.
 
+### Across MD steps, not just a single evaluation
+
+A single-point energy says nothing about what happens when the coordinates
+change, which is the case a paged vector can get wrong: the host rewrites the
+backing store every step and nothing invalidates pages already resident on
+the device. Over a 10-step argon run with a deliberately small cache, the
+paged kernel tracks nbnxm at every step:
+
+| step | eternia      | GROMACS      |
+|------|--------------|--------------|
+| 0    | -8491.76907  | -8.49176e+03 |
+| 1    | -8491.45633  | -8.49145e+03 |
+| 2    | -8490.51984  | -8.49052e+03 |
+| 3    | -8488.95954  | -8.48895e+03 |
+| 4    | -8486.77658  | -8.48677e+03 |
+| 5    | -8483.97234  | -8.48397e+03 |
+
+It stays correct because the hook builds a FRESH context per call, so nothing
+is ever resident from a previous step -- a property of the caller, not of the
+kernel. `NbCoro` therefore drops its caches on entry anyway, which is a no-op
+today and stops the obvious optimisation (cache the context across steps)
+from silently reintroducing staleness. The LBANN integration made exactly
+that mistake and served the first call's weights for a whole training run.
+
 ### Why the in-application runs stop short of VRAM
 
 The paged arrays measure 0.142 pair-list entries per atom (1728 -> 266,

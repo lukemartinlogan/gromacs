@@ -134,6 +134,27 @@ __device__ gy::YCoroMain NbCoro(gv::DeviceVector<int> cjp,
   // Per-block scratch: 2 u64 for the page range, then 64*3 floats for the
   // staged i-supercluster coordinates. GLOBAL, not __shared__, because a
   // co_await can exit the kernel and have this block relaunched.
+  // DROP THIS BLOCK'S CACHES FIRST.
+  //
+  // Today this is a no-op: the GROMACS hook creates a fresh context for every
+  // call, so no page is ever resident from a previous step. It is here
+  // because that is a property of the CALLER, not of this kernel, and the
+  // obvious optimisation -- cache the context across steps instead of
+  // rebuilding it -- would silently start serving the previous step's
+  // coordinates.
+  //
+  // That is not hypothetical. The LBANN integration cached its context, did
+  // not drop, and served the first call's weights for the rest of training:
+  // the forward pass was exact to 1.4e-07 on the first call and wrong by
+  // 1.2e-03 by the second, while the objective still fell so it looked like
+  // training was working.
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    cjp.DropAll();
+    xq.DropAll();
+  }
+  __syncthreads();
+
   u64 *pg_lo_s = scratch + static_cast<u64>(block) * kScratchU64PerBlock;
   u64 *pg_hi_s = pg_lo_s + 1;
   u32 *touched = reinterpret_cast<u32 *>(pg_lo_s + 2);
