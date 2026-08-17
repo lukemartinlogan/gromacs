@@ -42,6 +42,7 @@
 // header declares its own namespace, and including it inside namespace gmx
 // would nest it as gmx::eternia_gmx and fail to link against the library.
 #if defined(GMX_HAS_ETERNIA)
+#    include <chrono>
 #    include <cmath>
 #    include <cstdio>
 #    include <cstdlib>
@@ -549,7 +550,12 @@ namespace
  */
 void eterniaCompareForces(NbnxmGpu* nb, const InteractionLocality iloc)
 {
-    static const bool enabled = (std::getenv("GMX_ETERNIA_NB") != nullptr);
+    // ETERNIA_BASELINE turns the paged kernel OFF without changing anything
+    // else, so the same binary and the same tpr measure stock nbnxm alone.
+    // Separate from GMX_ETERNIA_NB rather than its absence, so a comparison
+    // changes exactly one variable between the two runs.
+    static const bool enabled = (std::getenv("GMX_ETERNIA_NB") != nullptr &&
+                                 std::getenv("ETERNIA_BASELINE") == nullptr);
     if (!enabled || !eternia_gmx::Available())
     {
         return;
@@ -654,7 +660,18 @@ void eterniaCompareForces(NbnxmGpu* nb, const InteractionLocality iloc)
     // nbnxm keeps the shift vectors on the device already; hand the same
     // buffer over rather than copying it.
     const float* dShift = reinterpret_cast<const float*>(adat->shiftVec);
+    // TIME the paged kernel. The hook reported faults and an energy but never
+    // a duration, so "how fast is the paged path" had no answer -- and mdrun's
+    // own performance figures cannot supply one, because this kernel runs
+    // ALONGSIDE nbnxm rather than instead of it, so wall clock for the run
+    // includes both. Timed here, the paged kernel's cost stands alone.
+    cudaDeviceSynchronize();
+    const auto t0 = std::chrono::steady_clock::now();
     const bool ok = eternia_gmx::Compute(ctx, c6, c12, rc * rc, dShift, dF, &energy);
+    cudaDeviceSynchronize();
+    const double eternia_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
     if (!ok)
     {
         std::fprintf(stderr, "[eternia] Compute failed: %s\n", eternia_gmx::LastError());
@@ -707,12 +724,12 @@ void eterniaCompareForces(NbnxmGpu* nb, const InteractionLocality iloc)
         std::fprintf(stderr,
                      "[eternia] atoms=%d sci=%d cjPacked=%d | list faults=%llu "
                      "evicts=%llu | xq faults=%llu evicts=%llu | get_err=%llu | "
-                     "pairs=%llu | %s%.9g\n",
+                     "pairs=%llu | ms=%.3f | %s%.9g\n",
                      nAtoms, numSci, numCjP,
                      (unsigned long long)st.list_faults, (unsigned long long)st.list_evicts,
                      (unsigned long long)st.xq_faults, (unsigned long long)st.xq_evicts,
                      (unsigned long long)st.get_errors, (unsigned long long)st.pairs,
-                     valid ? "E=" : "INVALID_E=", energy);
+                     eternia_ms, valid ? "E=" : "INVALID_E=", energy);
         if (!valid)
         {
             std::fprintf(stderr,
