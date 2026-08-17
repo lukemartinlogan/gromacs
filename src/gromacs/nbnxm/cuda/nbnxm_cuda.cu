@@ -38,6 +38,18 @@
  */
 #include "gmxpre.h"
 
+// Eternia paged nonbonded comparison kernel. Included at FILE SCOPE: this
+// header declares its own namespace, and including it inside namespace gmx
+// would nest it as gmx::eternia_gmx and fail to link against the library.
+#if defined(GMX_HAS_ETERNIA)
+#    include <cmath>
+#    include <cstdio>
+#    include <cstdlib>
+#    include <vector>
+
+#    include "eternia_nb.h"
+#endif
+
 #include "config.h"
 
 #include <cassert>
@@ -513,6 +525,134 @@ static inline void gpuLaunchKernelSciSort(GpuPairlist* plist, const DeviceStream
    the local x+q H2D (and all preceding) tasks are complete and synchronize
    with this event in the non-local stream before launching the non-bonded kernel.
  */
+
+#if defined(GMX_HAS_ETERNIA)
+namespace
+{
+
+/*! \brief Run the Eternia paged nonbonded kernel on nbnxm's OWN pair list and
+ * compare its forces against the ones the production kernel just produced.
+ *
+ * This is a COMPARISON, not a replacement. The paged kernel computes plain
+ * Lennard-Jones and implements neither electrostatics, per-atom exclusions
+ * beyond the cluster imask, nor the LJ modifiers; substituting it on a system
+ * that uses any of those would silently give wrong forces. So the production
+ * kernel always runs, and this checks that the paged one reproduces it on a
+ * system where the physics coincide -- a monatomic Lennard-Jones fluid.
+ *
+ * Enabled by GMX_ETERNIA_NB. The point of running it HERE rather than in the
+ * standalone bench is that the data is GROMACS's: its cluster decomposition,
+ * its imask packing, its coordinate layout. A synthetic generator agreeing
+ * with a synthetic reference proves much less.
+ */
+void eterniaCompareForces(NbnxmGpu* nb, const InteractionLocality iloc)
+{
+    static const bool enabled = (std::getenv("GMX_ETERNIA_NB") != nullptr);
+    if (!enabled || !eternia_gmx::Available())
+    {
+        return;
+    }
+    NBAtomDataGpu* adat  = nb->atdat;
+    auto*          plist = nb->plist[iloc].get();
+    if (plist->numSci <= 0 || plist->numPackedJClusters <= 0)
+    {
+        return;
+    }
+
+    // Pull the pair list and coordinates back to the host. This is a
+    // validation path, so the cost does not matter; correctness of the
+    // comparison does.
+    const int nAtoms   = adat->numAtoms;
+    const int numSci   = plist->numSci;
+    const int numCjP   = plist->numPackedJClusters;
+
+    std::vector<nbnxm_sci_t>       hSci(numSci);
+    std::vector<nbnxm_cj_packed_t> hCjp(numCjP);
+    std::vector<Float4>            hXq(nAtoms);
+    copyFromDeviceBuffer(hSci.data(), &plist->sci, 0, numSci,
+                         *nb->deviceStreams[iloc], GpuApiCallBehavior::Sync, nullptr);
+    copyFromDeviceBuffer(hCjp.data(), &plist->cjPacked, 0, numCjP,
+                         *nb->deviceStreams[iloc], GpuApiCallBehavior::Sync, nullptr);
+    copyFromDeviceBuffer(hXq.data(), &adat->xq, 0, nAtoms,
+                         *nb->deviceStreams[iloc], GpuApiCallBehavior::Sync, nullptr);
+
+    std::vector<int>      cj(static_cast<size_t>(numCjP) * c_jGroupSize);
+    std::vector<unsigned> imask(numCjP);
+    for (int e = 0; e < numCjP; ++e)
+    {
+        for (int q = 0; q < c_jGroupSize; ++q)
+        {
+            cj[static_cast<size_t>(e) * c_jGroupSize + q] = hCjp[e].cj[q];
+        }
+        imask[e] = hCjp[e].imei[0].imask;
+    }
+    std::vector<eternia_gmx::Sci> sci(numSci);
+    for (int i = 0; i < numSci; ++i)
+    {
+        sci[i] = { hSci[i].sci, hSci[i].shift, hSci[i].cjPackedBegin, hSci[i].cjPackedEnd };
+    }
+    std::vector<float> xq(static_cast<size_t>(nAtoms) * 4);
+    for (int a = 0; a < nAtoms; ++a)
+    {
+        xq[a * 4 + 0] = hXq[a].x;
+        xq[a * 4 + 1] = hXq[a].y;
+        xq[a * 4 + 2] = hXq[a].z;
+        xq[a * 4 + 3] = hXq[a].w;
+    }
+
+    eternia_gmx::Config cfg;
+    cfg.stats = true;
+    eternia_gmx::ClusterLayout lay;
+    lay.clusterSize   = c_clusterSize;
+    lay.clustersPerSc = c_superClusterSize;
+    lay.jGroupSize    = c_jGroupSize;
+
+    auto* ctx = eternia_gmx::Create(cfg, lay, nAtoms, numSci, numCjP);
+    if (ctx == nullptr)
+    {
+        std::fprintf(stderr, "[eternia] Create failed: %s\n", eternia_gmx::LastError());
+        return;
+    }
+    if (!eternia_gmx::Upload(ctx, cj.data(), imask.data(), xq.data(), sci.data()))
+    {
+        std::fprintf(stderr, "[eternia] Upload failed: %s\n", eternia_gmx::LastError());
+        eternia_gmx::Destroy(ctx);
+        return;
+    }
+
+    float* dF = nullptr;
+    cudaMalloc(&dF, static_cast<size_t>(nAtoms) * 4 * sizeof(float));
+    cudaMemset(dF, 0, static_cast<size_t>(nAtoms) * 4 * sizeof(float));
+    double energy = 0.0;
+    // c6/c12 for the single LJ type pair; taken from the environment so the
+    // comparison does not have to decode nbnxm's parameter tables.
+    const float c6  = std::getenv("GMX_ETERNIA_C6") ? std::atof(std::getenv("GMX_ETERNIA_C6")) : 1.0f;
+    const float c12 = std::getenv("GMX_ETERNIA_C12") ? std::atof(std::getenv("GMX_ETERNIA_C12")) : 1.0f;
+    const float rc  = std::getenv("GMX_ETERNIA_RC") ? std::atof(std::getenv("GMX_ETERNIA_RC")) : 1.0f;
+    const bool ok = eternia_gmx::Compute(ctx, c6, c12, rc * rc, dF, &energy);
+    if (!ok)
+    {
+        std::fprintf(stderr, "[eternia] Compute failed: %s\n", eternia_gmx::LastError());
+    }
+    else
+    {
+        const auto st = eternia_gmx::GetStats(ctx);
+        std::fprintf(stderr,
+                     "[eternia] atoms=%d sci=%d cjPacked=%d | list faults=%llu "
+                     "evicts=%llu | xq faults=%llu evicts=%llu | get_err=%llu | "
+                     "pairs=%llu | E=%.9g\n",
+                     nAtoms, numSci, numCjP,
+                     (unsigned long long)st.list_faults, (unsigned long long)st.list_evicts,
+                     (unsigned long long)st.xq_faults, (unsigned long long)st.xq_evicts,
+                     (unsigned long long)st.get_errors, (unsigned long long)st.pairs, energy);
+    }
+    cudaFree(dF);
+    eternia_gmx::Destroy(ctx);
+}
+
+} // namespace
+#endif // GMX_HAS_ETERNIA
+
 void gpu_launch_kernel(NbnxmGpu* nb, const gmx::StepWorkload& stepWork, const InteractionLocality iloc)
 {
     NBAtomDataGpu*      adat         = nb->atdat;
@@ -622,6 +762,10 @@ void gpu_launch_kernel(NbnxmGpu* nb, const gmx::StepWorkload& stepWork, const In
         /* Windows: force flushing WDDM queue */
         cudaStreamQuery(deviceStream.stream());
     }
+
+#if defined(GMX_HAS_ETERNIA)
+    eterniaCompareForces(nb, iloc);
+#endif
 }
 
 /*! Calculates the amount of shared memory required by the CUDA kernel in use. */

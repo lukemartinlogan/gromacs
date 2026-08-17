@@ -190,6 +190,18 @@ if (GMX_GPU_CUDA)
         target_link_libraries(libgromacs PRIVATE CUDA::cufft)
     endif()
 
+    # Eternia paged nonbonded kernel: the pair list and coordinates live in
+    # the Clio CTE and are paged into the GPU from inside the kernel. Wired as
+    # a comparison against nbnxm's own kernel, not as a replacement -- see
+    # src/gromacs/eternia/eternia_nb.h for what it does and does not compute.
+    if (GMX_ETERNIA)
+        include(${CMAKE_CURRENT_SOURCE_DIR}/eternia/eternia_lib.cmake)
+        target_link_libraries(libgromacs PRIVATE GMX::eternia ${GMX_ETERNIA_LIBS})
+        target_include_directories(libgromacs PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/eternia)
+        target_compile_definitions(libgromacs PRIVATE GMX_HAS_ETERNIA)
+    endif()
+
     target_compile_options(libgromacs PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${GMX_CUDA_FLAGS}>")
     set_target_properties(libgromacs PROPERTIES CUDA_ARCHITECTURES "${GMX_CUDA_ARCHITECTURES}")
 
