@@ -82,3 +82,21 @@ target_link_libraries(gmx_eternia_nb_bench PRIVATE
     clio::run::cxx clio::run::clio_run_cxx_gpu clio::run::admin_client
     clio::run::bdev_client clio::cte::core_client ctp::cudacxx CUDA::cudart)
 set_target_properties(gmx_eternia_nb_bench PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+
+# ---------------------------------------------------------------------------
+# The library half, for linking into GROMACS. ETERNIA_LIB_ONLY skips the
+# standalone benches so the ExternalProject build stays small.
+# ---------------------------------------------------------------------------
+option(ETERNIA_LIB_ONLY "Build only the paged nonbonded library" OFF)
+
+set_source_files_properties(eternia_nb.cc PROPERTIES LANGUAGE CUDA)
+add_library(gmx_eternia_nb STATIC eternia_nb.cc)
+target_compile_definitions(gmx_eternia_nb PRIVATE ETERNIA_GMX_ENABLED CLIO_YIELD_CORO)
+target_include_directories(gmx_eternia_nb PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR} ${IOWARP_CORE_INCLUDE_DIR})
+target_link_libraries(gmx_eternia_nb PUBLIC
+    clio::run::cxx clio::run::clio_run_cxx_gpu clio::run::admin_client
+    clio::run::bdev_client clio::cte::core_client ctp::cudacxx CUDA::cudart)
+set_target_properties(gmx_eternia_nb PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+install(TARGETS gmx_eternia_nb ARCHIVE DESTINATION lib)
+install(FILES eternia_nb.h DESTINATION include)
