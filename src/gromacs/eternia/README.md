@@ -235,6 +235,31 @@ Identical to the last digit whether nothing is evicted or 2048 of 2072 pages
 are. The 0.15 kJ/mol against the reference is 2e-6 relative, single-precision
 rounding on a sum of 1.5 million pair terms.
 
+Scaled up, at 110,592 atoms with the same tiny cache:
+
+    atoms=110592 sci=2236 cjPacked=15710
+      list faults=2320 evicts=2256 | xq faults=13236 evicts=13172
+      get_err=0 | pairs=11888640 | E=-543473.134
+
+against a GROMACS reference of -543472, again 2e-6 relative.
+
+### Why the in-application runs stop short of VRAM
+
+The paged arrays measure 0.142 pair-list entries per atom (1728 -> 266,
+110,592 -> 15,710), so at 32 bytes per padded entry plus a float4 of
+coordinates the footprint is about 20.5 bytes per atom. Exceeding this
+machine's 7.99 GiB of VRAM therefore needs roughly **418 million atoms**, and
+GROMACS's own host-side structures for a system that size would want tens of
+GiB before the pair list is even built. That is a limit of the box, not of
+the kernel.
+
+So the two halves of the evidence are deliberately different runs: the
+IN-APPLICATION runs prove the kernel reproduces nbnxm exactly, including
+under heavy eviction, at the largest size this machine can build; the
+STANDALONE bench proves the same kernel scales past VRAM, at 10.90 GiB with
+712 billion pair interactions. Neither claim is made on the other's
+evidence.
+
 ## Next
 
 Wire this into GROMACS proper: replace `pme_gpu_spread` and the matching
