@@ -177,6 +177,45 @@ The CPU reference is not run at this size (it is O(pairs), and 712 billion of
 them is not a check, it is a second experiment). The reference covers the
 sweep at small sizes; the invariant covers the large ones.
 
+## Validated inside GROMACS, against nbnxm itself
+
+`GMX_ETERNIA=ON` links the paged kernel into libgromacs; `GMX_ETERNIA_NB=1`
+runs it from `gpu_launch_kernel` alongside the production kernel, on the same
+cluster pair list. On a 1728-atom argon LJ fluid (no charges, no bonds, no
+LJ modifier, rvdw = 1.0):
+
+    [eternia] atoms=1728 sci=111 cjPacked=266 | list faults=64 evicts=0
+              | xq faults=64 evicts=0 | get_err=0 | pairs=185760
+              | E=-8491.76907
+
+    GROMACS LJ (SR) = -8491.76
+
+Reaching that took three corrections, and every one was a semantic difference
+between this kernel's assumptions and nbnxm's, invisible to the standalone
+bench because its reference shared those assumptions:
+
+1. **Two mask words, not one.** nbnxm splits a cluster pair across two warps
+   (`imei[c_clusterPairSplit]`) and each warp owns half the j-cluster's
+   atoms, so the words can differ once pruning has run. (On a fresh list they
+   are identical, so this one did not move the energy -- it is still wrong to
+   ignore.)
+
+2. **Each unordered pair is listed once, not twice.** A pair of distinct
+   clusters appears in one direction only, so halving the energy -- as this
+   kernel did, assuming a full list -- undercounts by two. The self-cluster
+   is the exception and must be masked to the triangle j > i, which is
+   nbnxm's `nonSelfInteraction | (ci != cj)`.
+
+3. **Periodic shifts.** Each i-supercluster entry carries a shift index and
+   nbnxm adds `shift_vec[shift]` to the i-atom coordinates. Ignoring it makes
+   every non-central entry compute distances for the wrong periodic image,
+   and those pairs fall outside the cutoff and vanish. This was most of the
+   list, not an edge case: 111 sci entries for 27 superclusters is about four
+   shifts each.
+
+The progression was -4610.08, then -7097.99, then -8491.77 against a
+reference of -8491.76.
+
 ## Next
 
 Wire this into GROMACS proper: replace `pme_gpu_spread` and the matching

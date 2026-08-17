@@ -52,6 +52,10 @@ struct Config {
   std::uint32_t nblocks = 64;
   std::uint32_t nthreads = 128;
   std::uint32_t slots = 8;    //!< resident pages per block
+  /** nbnxm's central (self-image) shift index. A cluster pair with this
+   *  shift whose i- and j-clusters coincide is the diagonal, and must be
+   *  counted triangularly or every intra-cluster pair is counted twice. */
+  int centralShift = -1;
   bool stats = false;
 };
 
@@ -105,8 +109,18 @@ bool Upload(Context* ctx, const int* cj, const unsigned* imask,
  * @param c6, c12   Lennard-Jones parameters, single type pair
  * @param cutoffSq  squared cutoff
  */
+/**
+ * @param shiftVec_device  numShifts * 3 floats on the device. nbnxm gives each
+ *   i-supercluster entry a periodic shift index and the kernel adds
+ *   shift_vec[shift] to the i-atom coordinates; without it every non-central
+ *   entry computes distances for the wrong periodic image, and those pairs
+ *   silently fall outside the cutoff. A 1728-atom box produced 111 sci
+ *   entries for 27 superclusters -- about four shifts each -- so this is most
+ *   of the list, not an edge case.
+ */
 bool Compute(Context* ctx, float c6, float c12, float cutoffSq,
-             float* forces_device, double* energy_out);
+             const float* shiftVec_device, float* forces_device,
+             double* energy_out);
 
 Stats GetStats(Context* ctx);
 const char* LastError();

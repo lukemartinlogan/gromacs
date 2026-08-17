@@ -97,6 +97,7 @@ struct NbParams {
   float cutoffSq;
   float c6;
   float c12;
+  int centralShift;   //!< see Config::centralShift
 };
 
 /** LJ force magnitude / r, and energy, matching the reference exactly. */
@@ -119,6 +120,7 @@ CTP_INLINE_CROSS_FUN void LjPair(float rsq, const NbParams &p, float *fscal,
  */
 __device__ gy::YCoroMain NbCoro(gv::DeviceVector<int> cjp,
                                 gv::DeviceVector<float> xq, float *f,
+                                const float *shiftVec,
                                 const Sci *scis, int numSci, NbParams prm,
                                 double *energy_out,
                                 unsigned long long *pairs_out, u64 *scratch,
@@ -139,6 +141,10 @@ __device__ gy::YCoroMain NbCoro(gv::DeviceVector<int> cjp,
 
   for (int s = block; s < numSci; s += nblocks) {
     const Sci sc = scis[s];
+    // The diagonal: a cluster pair at the self-image shift whose i- and
+    // j-clusters coincide. nbnxm counts each unordered atom pair exactly
+    // once, which for that case means the triangle j > i.
+    const bool isCentral = (sc.shift == prm.centralShift);
     const u64 i0 = static_cast<u64>(sc.sci) * kAtomsPerSc;
 
     // STAGE the i-supercluster's coordinates OUT of the page cache.
@@ -156,8 +162,16 @@ __device__ gy::YCoroMain NbCoro(gv::DeviceVector<int> cjp,
     {
       gv::DeviceVector<float> xi = xq;
       co_await xi.HoldPageCoro(i0 * 4, static_cast<u64>(kAtomsPerSc) * 4, &run);
+      // The i-atoms carry this entry's periodic shift, exactly as nbnxm does
+      // (xqbuf = xq[ai] + shift_vec[nb_sci.shift]). Staging is the right place
+      // for it: applied once per atom rather than once per pair.
+      const float sx = shiftVec ? shiftVec[sc.shift * 3 + 0] : 0.0f;
+      const float sy = shiftVec ? shiftVec[sc.shift * 3 + 1] : 0.0f;
+      const float sz = shiftVec ? shiftVec[sc.shift * 3 + 2] : 0.0f;
       for (u32 t = threadIdx.x; t < kAtomsPerSc * 3; t += blockDim.x) {
-        xi_s[t] = xi.at(i0 * 4 + (t / 3) * 4 + (t % 3));
+        const u32 d = t % 3;
+        const float sh = (d == 0) ? sx : ((d == 1) ? sy : sz);
+        xi_s[t] = xi.at(i0 * 4 + (t / 3) * 4 + d) + sh;
       }
       __syncthreads();
     }
@@ -276,6 +290,19 @@ __device__ gy::YCoroMain NbCoro(gv::DeviceVector<int> cjp,
                   const unsigned imask = static_cast<unsigned>(cjp.at(
                       base + kJGroupSize + (jj >= kClusterSize / 2 ? 1 : 0)));
                   if (!((imask >> (jslot * kClustersPerSc + icl)) & 1u)) continue;
+                  // COUNT EACH UNORDERED PAIR ONCE, as nbnxm does. A pair of
+                  // distinct clusters is listed in one direction only, so
+                  // every (i, j) here is already unique. The self-cluster is
+                  // the exception: it would yield both (a, b) and (b, a), so
+                  // it is masked to the triangle -- the same rule as nbnxm's
+                  // `nonSelfInteraction | (ci != cj)`.
+                  const bool sameCluster =
+                      (static_cast<u64>(cj) ==
+                       static_cast<u64>(sc.sci) * kClustersPerSc + icl);
+                  if (isCentral && sameCluster &&
+                      jj <= static_cast<int>(ii % kClusterSize)) {
+                    continue;
+                  }
                   const u64 ja = static_cast<u64>(cj) * kClusterSize + jj;
                   if (ja == ia) continue;
                   const u64 jo = ja * 4;
@@ -288,7 +315,9 @@ __device__ gy::YCoroMain NbCoro(gv::DeviceVector<int> cjp,
                   if (rsq >= prm.cutoffSq || rsq == 0.0f) continue;
                   float fscal, ener;
                   LjPair(rsq, prm, &fscal, &ener);
-                  e_local += 0.5 * static_cast<double>(ener);
+                  // No halving: nbnxm lists each unordered pair once, so
+                  // every pair reached here is counted exactly once already.
+                  e_local += static_cast<double>(ener);
                   atomicAdd(&f[ia * 4 + 0], dx * fscal);
                   atomicAdd(&f[ia * 4 + 1], dy * fscal);
                   atomicAdd(&f[ia * 4 + 2], dz * fscal);
@@ -311,7 +340,8 @@ __device__ gy::YCoroMain NbCoro(gv::DeviceVector<int> cjp,
 
 __global__ void NbKernel(clio::run::IpcManagerGpuInfo info,
                          gv::DeviceVector<int> cjp, gv::DeviceVector<float> xq,
-                         float *f, const Sci *scis, int numSci, NbParams prm,
+                         float *f, const float *shiftVec,
+                         const Sci *scis, int numSci, NbParams prm,
                          double *energy_out, unsigned long long *pairs_out,
                          u64 *scratch, u32 nblocks, gy::YieldableView<> yv,
                          gy::YieldStackView ys) {
@@ -320,8 +350,8 @@ __global__ void NbKernel(clio::run::IpcManagerGpuInfo info,
   xq.block_override_ = yv.Block();
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
-  CLIO_YCORO_RUN(NbCoro(cjp, xq, f, scis, numSci, prm, energy_out, pairs_out,
-                        scratch, yv.Block(), nblocks));
+  CLIO_YCORO_RUN(NbCoro(cjp, xq, f, shiftVec, scis, numSci, prm, energy_out,
+                        pairs_out, scratch, yv.Block(), nblocks));
 }
 
 #endif  // ETERNIA_NB_CORO
@@ -477,21 +507,22 @@ bool Upload(Context* ctx, const int* cj, const unsigned* imask,
 }
 
 bool Compute(Context* ctx, float c6, float c12, float cutoffSq,
-             float* forces_device, double* energy_out)
+             const float* shiftVec_device, float* forces_device,
+             double* energy_out)
 {
   if (!ctx || !forces_device) { SetErr("Compute: null argument"); return false; }
   auto gpu = CLIO_CPU_IPC->GetGpuIpcManager()->GetGpuInfo(ctx->cfg.gpu_id);
   cudaMemset(ctx->d_energy, 0, sizeof(double));
   cudaMemset(ctx->d_pairs, 0, sizeof(unsigned long long));
 
-  NbParams prm{cutoffSq, c6, c12};
+  NbParams prm{cutoffSq, c6, c12, ctx->cfg.centralShift};
   auto dcj = ctx->vcj->GetDevice(ctx->cfg.gpu_id);
   auto dxq = ctx->vxq->GetDevice(ctx->cfg.gpu_id);
   YieldRunner runner(ctx->cfg.nblocks, ctx->cfg.nthreads);
   const u32 rounds = runner.Run(
     [&](dim3 g, dim3 b, gy::YieldableView<> v, gy::YieldStackView sv) {
       NbKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
-        gpu, dcj, dxq, forces_device, ctx->d_sci, ctx->numSci, prm,
+        gpu, dcj, dxq, forces_device, shiftVec_device, ctx->d_sci, ctx->numSci, prm,
         ctx->d_energy, ctx->d_pairs, ctx->d_scratch, ctx->cfg.nblocks, v, sv);
     });
   const cudaError_t le = cudaGetLastError();
@@ -532,7 +563,7 @@ const char* LastError() { return "built without the Eternia backend"; }
 Context* Create(const Config&, const ClusterLayout&, int, int, int) { return nullptr; }
 void Destroy(Context*) {}
 bool Upload(Context*, const int*, const unsigned*, const float*, const Sci*) { return false; }
-bool Compute(Context*, float, float, float, float*, double*) { return false; }
+bool Compute(Context*, float, float, float, const float*, float*, double*) { return false; }
 Stats GetStats(Context*) { return Stats(); }
 }  // namespace eternia_gmx
 

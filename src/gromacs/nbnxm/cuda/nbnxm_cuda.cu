@@ -604,7 +604,8 @@ void eterniaCompareForces(NbnxmGpu* nb, const InteractionLocality iloc)
     }
 
     eternia_gmx::Config cfg;
-    cfg.stats = true;
+    cfg.stats        = true;
+    cfg.centralShift = gmx::c_centralShiftIndex;
     eternia_gmx::ClusterLayout lay;
     lay.clusterSize   = c_clusterSize;
     lay.clustersPerSc = c_superClusterSize;
@@ -632,7 +633,10 @@ void eterniaCompareForces(NbnxmGpu* nb, const InteractionLocality iloc)
     const float c6  = std::getenv("GMX_ETERNIA_C6") ? std::atof(std::getenv("GMX_ETERNIA_C6")) : 1.0f;
     const float c12 = std::getenv("GMX_ETERNIA_C12") ? std::atof(std::getenv("GMX_ETERNIA_C12")) : 1.0f;
     const float rc  = std::getenv("GMX_ETERNIA_RC") ? std::atof(std::getenv("GMX_ETERNIA_RC")) : 1.0f;
-    const bool ok = eternia_gmx::Compute(ctx, c6, c12, rc * rc, dF, &energy);
+    // nbnxm keeps the shift vectors on the device already; hand the same
+    // buffer over rather than copying it.
+    const float* dShift = reinterpret_cast<const float*>(adat->shiftVec);
+    const bool ok = eternia_gmx::Compute(ctx, c6, c12, rc * rc, dShift, dF, &energy);
     if (!ok)
     {
         std::fprintf(stderr, "[eternia] Compute failed: %s\n", eternia_gmx::LastError());
