@@ -306,6 +306,60 @@ STANDALONE bench proves the same kernel scales past VRAM, at 10.90 GiB with
 712 billion pair interactions. Neither claim is made on the other's
 evidence.
 
+## Peak VRAM, and where the hook's memory actually goes
+
+Sampled with nvidia-smi across whole runs, using the 64 MB `hbm` tier in the
+`clio.yaml` beside the test scripts:
+
+| atoms   | stock  | with the hook |
+|---------|--------|---------------|
+| 1,728   | 10 MiB | 250 MiB |
+| 8,000   | 10 MiB | 230 MiB |
+| 216,000 | 174 MiB | 302 MiB |
+
+The hook's total is roughly FLAT while GROMACS's own grows: 125x more atoms
+moves it by less than the sampling noise between the first two rows. So the
+paged arrays genuinely are not resident, and what the hook costs is the Clio
+runtime's baseline rather than the data it pages.
+
+That is not yet a saving, and cannot be, because the hook runs ALONGSIDE
+nbnxm's kernel rather than replacing it -- GROMACS still allocates the pair
+list and coordinates whatever this does. What the flatness establishes is that
+a real substitution would bound the nonbonded memory by the page cache. At
+these sizes there would be nothing to collect: the coordinates are 3.5 MB at
+216,000 atoms. The regime where it would matter is a list of many GB.
+
+## A discrepancy at 216,000 atoms, and why it is probably not ours
+
+At 216,000 atoms the two disagree for the first time: -1061470.96 against
+GROMACS's -1.06145e+06, about 2e-5 relative. Every smaller system agreed to all
+six digits GROMACS prints.
+
+The evidence says the paged kernel is the self-consistent one:
+
+| atoms   | GROMACS per atom | eternia per atom |
+|---------|------------------|------------------|
+| 1,728   | -4.914213        | -4.914218 |
+| 8,000   | -4.914225        | -4.914219 |
+| 216,000 | -4.914120        | -4.914217 |
+
+`make_argon.py` builds a PERFECT cubic lattice -- deterministic, no jitter,
+fixed spacing -- and the cutoff fits inside half the box at every size. The
+per-atom energy is therefore required to be size-independent. eternia's is,
+to six digits across a 125x range. GROMACS's moves, and only at the largest
+pair count.
+
+The likely cause is accumulation precision, not paging: this kernel sums each
+i-atom's contributions in `double`, while GROMACS is a mixed-precision build
+summing 23.2 million pair terms in `float`. The deviation grows with pair
+count (1.1e-06 at 0.86M pairs, 2.0e-05 at 23.2M), which is the shape of
+accumulation error rather than of a geometry or list bug.
+
+This is stated as the likely cause rather than the established one. The way to
+settle it is a double-precision GROMACS build (`-DGMX_DOUBLE=ON`), which has
+not been run here -- until then it remains an argument from invariance, not a
+measurement.
+
 ## Re-verified
 
 Independently of the numbers above, the whole comparison was re-run from a
