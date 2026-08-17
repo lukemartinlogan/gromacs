@@ -32,6 +32,18 @@ cp "$(dirname "$0")/md10.mdp" md.mdp
 sed -i "s/^nsteps .*/nsteps          = $NSTEPS/" md.mdp
 "$GMX" grompp -f md.mdp -c conf.gro -p topol.top -o t.tpr -maxwarn 5 >/dev/null 2>&1
 
+# The exact answer, before either kernel gets a say. GROMACS is not a
+# sufficient reference on its own at large pair counts -- at 216,000 atoms its
+# mixed-precision accumulation is 9.8e-05 per atom off the truth, 100x worse
+# than the paged kernel -- so a two-way comparison there would convict the
+# wrong side.
+# STEP 0 ONLY: the lattice sum is exact for the generated configuration, and
+# gen-vel puts the atoms in motion immediately, so it says nothing about the
+# rows below the first.
+echo "== exact (lattice sum, double) -- step 0 only =="
+python3 "$(dirname "$0")/exact_lattice.py" --atoms "$(python3 -c "print($CELLS**3)")" |
+  sed -n 's/^exact total.*: /  LJ(SR) = /p'
+
 echo "== GROMACS =="
 "$GMX" mdrun -s t.tpr -nb gpu -ntmpi 1 -ntomp 4 -deffnm ref -nsteps "$NSTEPS" >/dev/null 2>&1
 grep -A3 "Energies (kJ/mol)" ref.log | grep -E "^ +-?[0-9]" | awk '{print "  LJ(SR) = "$1}'
