@@ -606,6 +606,22 @@ void eterniaCompareForces(NbnxmGpu* nb, const InteractionLocality iloc)
     eternia_gmx::Config cfg;
     cfg.stats        = true;
     cfg.centralShift = gmx::c_centralShiftIndex;
+    // Cache geometry from the environment, so a run can be forced to page
+    // rather than holding the whole list resident. Validating with everything
+    // resident says nothing about the paging path, which is the entire point
+    // of the vector.
+    if (const char* e = std::getenv("GMX_ETERNIA_PAGE_KB"))
+    {
+        cfg.page_bytes = static_cast<std::uint64_t>(std::atoll(e)) * 1024;
+    }
+    if (const char* e = std::getenv("GMX_ETERNIA_BLOCKS"))
+    {
+        cfg.nblocks = static_cast<std::uint32_t>(std::atoi(e));
+    }
+    if (const char* e = std::getenv("GMX_ETERNIA_SLOTS"))
+    {
+        cfg.slots = static_cast<std::uint32_t>(std::atoi(e));
+    }
     eternia_gmx::ClusterLayout lay;
     lay.clusterSize   = c_clusterSize;
     lay.clustersPerSc = c_superClusterSize;

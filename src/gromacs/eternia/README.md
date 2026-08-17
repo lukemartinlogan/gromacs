@@ -216,6 +216,25 @@ bench because its reference shared those assumptions:
 The progression was -4610.08, then -7097.99, then -8491.77 against a
 reference of -8491.76.
 
+### Correct under paging pressure, not just when everything is resident
+
+The first matching run held the whole list in cache (64 faults, 0 evictions),
+which says nothing about the paging path -- and the paging path is the entire
+point. `GMX_ETERNIA_PAGE_KB`, `GMX_ETERNIA_BLOCKS` and `GMX_ETERNIA_SLOTS`
+size the cache from the environment so a run can be forced to page. On a
+13,824-atom argon box, against a GROMACS reference of -67934.3:
+
+| page  | blocks | slots | list faults / evicts | xq faults / evicts | E           |
+|-------|--------|-------|----------------------|--------------------|-------------|
+| 256KB | 64     | 8     | 64 / 0               | 64 / 0             | -67934.1468 |
+| 4KB   | 8      | 3     | 128 / 104            | 2072 / 2048        | -67934.1468 |
+| 4KB   | 32     | 2     | 512 / 448            | 2414 / 2350        | -67934.1468 |
+| 1MB   | 4      | 2     | 4 / 0                | 4 / 0              | -67934.1468 |
+
+Identical to the last digit whether nothing is evicted or 2048 of 2072 pages
+are. The 0.15 kJ/mol against the reference is 2e-6 relative, single-precision
+rounding on a sum of 1.5 million pair terms.
+
 ## Next
 
 Wire this into GROMACS proper: replace `pme_gpu_spread` and the matching
