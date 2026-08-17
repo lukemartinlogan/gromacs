@@ -358,6 +358,23 @@ revision of this file proposed settling this with a `-DGMX_DOUBLE=ON` build.
 That would not have worked -- GROMACS does not support double precision with
 the CUDA nonbonded kernels -- and the lattice sum is both cheaper and exact.
 
+### A failed page read no longer looks like a result
+
+`get_err` was one field among many on a line ending in `E=...`, and compare.sh
+greps for `E=`. So a run in which page reads failed -- meaning some pairs were
+computed from data that never arrived -- appeared in the results table as an
+ordinary row, wrong by however much those pairs contributed, which can easily
+be small enough to look plausible.
+
+The hook now emits `INVALID_E=` instead of `E=` when `get_errors != 0`, plus an
+explicit `RESULT INVALID` line, and compare.sh will not parse the former as an
+energy and says so if any step produced one. A corrupted run now loses rows
+from the table rather than filling them with plausible numbers.
+
+This is the same class of defect as the LBANN half's fallback-to-El::Gemm under
+own-weights: a degraded path that reports success. It was worth looking for
+here specifically because that one was found there.
+
 ### Reading the `pairs` counter
 
 The same run reports `pairs=23220000`, while only 9,936,000 atom pairs lie

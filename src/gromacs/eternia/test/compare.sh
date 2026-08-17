@@ -56,4 +56,8 @@ GMX_ETERNIA_NB=1 GMX_ETERNIA_C6="$C6" GMX_ETERNIA_C12="$C12" GMX_ETERNIA_RC=1.0 
 GMX_ETERNIA_PAGE_KB=${PAGE_KB:-4} GMX_ETERNIA_BLOCKS=${BLOCKS:-32} \
 GMX_ETERNIA_SLOTS=${SLOTS:-2} \
   gdb -batch -ex run --args "$GMX" mdrun -s t.tpr -nb gpu -ntmpi 1 -ntomp 2 \
-      -deffnm etn -nsteps "$NSTEPS" 2>&1 | grep -oE "E=[-0-9.]+" | sed 's/^/  /'
+      -deffnm etn -nsteps "$NSTEPS" 2>&1 | tee etn.eternia.log |
+  grep -oE "(^|[^_])E=[-0-9.]+" | grep -oE "E=[-0-9.]+" | sed 's/^/  /'
+if grep -q "RESULT INVALID" etn.eternia.log; then
+  echo "  *** some steps produced no energy: failed page reads, see etn.eternia.log"
+fi

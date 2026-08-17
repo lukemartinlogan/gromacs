@@ -660,14 +660,30 @@ void eterniaCompareForces(NbnxmGpu* nb, const InteractionLocality iloc)
     else
     {
         const auto st = eternia_gmx::GetStats(ctx);
+        // A failed page read means some pairs were computed from data that
+        // never arrived, so the energy is wrong -- but it is wrong by however
+        // much those pairs contributed, which can be small enough to look
+        // plausible. get_err used to be one field among many on a line ending
+        // in "E=...", and compare.sh greps for E=, so a corrupted run appeared
+        // in the results table as an ordinary row. Do not emit a parsable
+        // energy at all in that case.
+        const bool valid = (st.get_errors == 0);
         std::fprintf(stderr,
                      "[eternia] atoms=%d sci=%d cjPacked=%d | list faults=%llu "
                      "evicts=%llu | xq faults=%llu evicts=%llu | get_err=%llu | "
-                     "pairs=%llu | E=%.9g\n",
+                     "pairs=%llu | %s%.9g\n",
                      nAtoms, numSci, numCjP,
                      (unsigned long long)st.list_faults, (unsigned long long)st.list_evicts,
                      (unsigned long long)st.xq_faults, (unsigned long long)st.xq_evicts,
-                     (unsigned long long)st.get_errors, (unsigned long long)st.pairs, energy);
+                     (unsigned long long)st.get_errors, (unsigned long long)st.pairs,
+                     valid ? "E=" : "INVALID_E=", energy);
+        if (!valid)
+        {
+            std::fprintf(stderr,
+                         "[eternia] RESULT INVALID: %llu page reads failed, so the "
+                         "energy above is computed from data that never arrived\n",
+                         (unsigned long long)st.get_errors);
+        }
     }
     cudaFree(dF);
     eternia_gmx::Destroy(ctx);
